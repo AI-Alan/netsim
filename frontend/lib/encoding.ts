@@ -1,5 +1,21 @@
-export function encodeSignal(bits: number[], enc: string): number[] {
-  const spb = 8;
+/**
+ * Line-code preview for the waveform canvas.
+ *
+ * Rules match backend/layers/physical/encoding.py (NRZ-L, NRZ-I, Manchester IEEE 802.3,
+ * Differential Manchester, AMI, 4B5B table + NRZ-I on the 5-bit stream). The simulation
+ * uses a larger samples_per_bit (e.g. 100); here we use DISPLAY_SPB for a lighter preview
+ * only — rules are identical, resolution differs.
+ */
+export const DISPLAY_SPB = 16;
+
+/** Number of NRZ-I line symbols after 4B5B (5 per padded nibble); null if not 4B5B. */
+export function encodedLineBitCount4B5B(bits: number[]): number {
+  const pad = [...bits];
+  while (pad.length % 4) pad.push(0);
+  return (pad.length / 4) * 5;
+}
+
+export function encodeSignal(bits: number[], enc: string, spb: number = DISPLAY_SPB): number[] {
   const samples: number[] = [];
 
   if (enc === "NRZ-L") {

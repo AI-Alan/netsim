@@ -52,13 +52,17 @@ class DataLinkSimReq(BaseModel):
     message:        str = "Hello NetSim"
     encoding:       str = "Manchester"
     medium:         str = "wired"
+    clock_rate:     int = 1000
+    samples_per_bit:int = 100
     framing:        str = "variable"
+    framing_kwargs: Dict[str, Any] = {}
     error_control:  str = "crc32"
     mac_protocol:   str = "csma_cd"
     flow_control:   str = "stop_and_wait"
     window_size:    int = 4
     collision_prob: float = 0.02
     link_error_rate:float = 0.0
+    inject_error:   bool = False
     medium_kwargs:  Dict[str, Any] = {}
     mac_kwargs:     Dict[str, Any] = {}
 
@@ -131,14 +135,15 @@ async def simulate_datalink(req: DataLinkSimReq):
     # Build physical + datalink stack
     phy = PhysicalLayerFactory.create(
         encoding_type=req.encoding, medium_type=req.medium,
-        device_id=req.src_device_id, clock_rate=1000,
-        samples_per_bit=100, medium_kwargs=req.medium_kwargs,
+        device_id=req.src_device_id, clock_rate=req.clock_rate,
+        samples_per_bit=req.samples_per_bit, medium_kwargs=req.medium_kwargs,
     )
     flow_kwargs = {"window": req.window_size} if req.flow_control in ("go_back_n","selective_repeat") else {}
     dll = DataLinkLayerFactory.create(
         device_id=req.src_device_id, mac_addr="aa:bb:cc:dd:ee:ff",
         framing=req.framing, error=req.error_control,
         mac_proto=req.mac_protocol, flow=req.flow_control,
+        framing_kwargs=req.framing_kwargs,
         flow_kwargs=flow_kwargs, mac_kwargs=req.mac_kwargs,
     )
     # Wire: dll → phy
@@ -154,6 +159,7 @@ async def simulate_datalink(req: DataLinkSimReq):
         "dst_mac": "ff:ff:ff:ff:ff:ff", "timestamp": 0.0,
         "channel_busy": False, "collision_prob": req.collision_prob,
         "link_error_rate": req.link_error_rate,
+        "inject_error": req.inject_error,
     })
     dll.send_down(pdu)
     return {"status":"ok","events_emitted":len(collected),"events":[sim_event_to_dict(e) for e in collected]}

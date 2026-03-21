@@ -15,6 +15,8 @@ import logging
 from abc import abstractmethod
 from typing import Optional
 
+_HEX_PREVIEW_N = 64
+
 from layers.base import Layer, LayerPDU
 from layers.datalink.models import EthernetFrame, ARPPacket
 from layers.datalink.framing import IFraming, FixedSizeFraming
@@ -24,6 +26,10 @@ from layers.datalink.flow_control import IFlowControl, StopAndWaitARQ
 from simulation.events import EventType, LayerName, PDU, SimEvent
 
 logger = logging.getLogger(__name__)
+
+
+def _hex_preview(data: bytes, n: int = _HEX_PREVIEW_N) -> str:
+    return data[:n].hex()
 
 
 class DataLinkLayer(Layer):
@@ -55,6 +61,8 @@ class DataLinkLayer(Layer):
                 "scheme":       self._framing.name,
                 "raw_bytes":    len(payload),
                 "framed_bytes": len(framed_raw),
+                "payload_hex_preview": _hex_preview(payload),
+                "framed_hex_preview": _hex_preview(framed_raw),
             }),
             meta={"detail": f"Framing: {self._framing.name}"},
         ))
@@ -89,6 +97,37 @@ class DataLinkLayer(Layer):
         # 3. Error control: append check bits
         protected = self._error.compute(framed_raw)
 
+        if pdu.meta.get("inject_error") and len(protected) > 0:
+            buf = bytearray(protected)
+            oh = int(self._error.overhead_bytes or 0)
+            pay_len = max(0, len(buf) - oh)
+            idx = (pay_len // 2) if pay_len else 0
+            idx = min(idx, len(buf) - 1)
+            buf[idx] ^= 0xAA
+            protected = bytes(buf)
+            vr = self._error.verify(protected)
+            detail = vr.detail
+            if vr.ok and self._error.name == "None":
+                detail = "Payload corrupted — no error control; corruption is undetectable"
+            self.emit(SimEvent(
+                timestamp=ts, event_type=EventType.ERROR_DETECTED,
+                layer=LayerName.DATALINK, src_device=self.device_id,
+                pdu=PDU(type="error", headers={
+                    "scheme":       self._error.name,
+                    "detail":       detail,
+                    "dropped":      vr.dropped,
+                    "injected":     True,
+                }),
+                meta={"detail": "Educational: intentional bit flip after FCS/checksum"},
+            ))
+            if vr.dropped:
+                self.emit(SimEvent(
+                    timestamp=ts, event_type=EventType.FRAME_DROPPED,
+                    layer=LayerName.DATALINK, src_device=self.device_id,
+                    pdu=PDU(type="frame", headers={"reason": vr.detail}),
+                ))
+                return
+
         # 4. Build Ethernet frame
         frame = EthernetFrame(
             dst_mac=dst_mac, src_mac=self.mac_addr,
@@ -114,6 +153,7 @@ class DataLinkLayer(Layer):
         ))
 
         # 6. FRAME_SENT
+        wire_bytes = frame.to_bytes()
         self.emit(SimEvent(
             timestamp=ts, event_type=EventType.FRAME_SENT,
             layer=LayerName.DATALINK, src_device=self.device_id,
@@ -125,11 +165,13 @@ class DataLinkLayer(Layer):
                 "mac_protocol":   self._mac.name,
                 "arq_protocol":   self._flow.name,
                 "protected_len":  len(protected),
+                "protected_hex_preview": _hex_preview(protected),
+                "on_wire_hex_preview": _hex_preview(wire_bytes),
             }),
         ))
 
         # 7. Pass down
-        pdu.data = frame.to_bytes()
+        pdu.data = wire_bytes
         if self._lower:
             self._lower.send_down(pdu)
 
@@ -163,12 +205,15 @@ class DataLinkLayer(Layer):
         payload = self._framing.deframe(payload_checked)
 
         # 3. FRAME_RECEIVED
+        txt_preview = payload.decode("utf-8", errors="replace")[:200]
         self.emit(SimEvent(
             timestamp=ts, event_type=EventType.FRAME_RECEIVED,
             layer=LayerName.DATALINK, src_device=self.device_id,
             pdu=PDU(type="frame", headers={
                 "error_check": result.detail,
                 "payload_len": len(payload),
+                "payload_hex_preview": _hex_preview(payload),
+                "payload_text_preview": txt_preview,
             }),
         ))
 
