@@ -1,0 +1,8 @@
+*,*::before,*::after{box-sizing:border-box;}
+body{margin:0;padding:0;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:#090c13;}
+::-webkit-scrollbar-thumb{background:#1e2540;border-radius:2px;}
+::-webkit-scrollbar-thumb:hover{background:#2a3550;}
+select{outline:none;}
+input[type="range"]{height:3px;}
