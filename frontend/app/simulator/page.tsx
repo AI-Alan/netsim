@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useSimStore } from "@/lib/store";
 import { connectWS } from "@/lib/websocket";
 import { encodeSignal, ENC_COLORS, encodedLineBitCount4B5B } from "@/lib/encoding";
-import type { DeviceNode, NetworkLink, DeviceType, MediumType } from "@/lib/types";
+import type { DeviceNode, NetworkLink, DeviceType, MediumType, SimEvent } from "@/lib/types";
 import {
   fetchBackendHealth,
   fetchSimOptions,
@@ -26,6 +26,7 @@ const TCPIP_LAYERS = [
 ];
 
 const DEVICE_META: Record<DeviceType,{icon:string;color:string;tcpip:number}> = {
+  host:    { icon:"🖥",  color:"#3b82f6", tcpip:4 },
   computer:{ icon:"🖥",  color:"#3b82f6", tcpip:4 },
   server:  { icon:"🗄",  color:"#a855f7", tcpip:4 },
   router:  { icon:"📡",  color:"#f59e0b", tcpip:2 },
@@ -89,12 +90,22 @@ function isDeviceType(s:string): s is DeviceType{
   return Object.prototype.hasOwnProperty.call(DEVICE_META,s);
 }
 
-const DEVICE_TYPES=(Object.keys(DEVICE_META) as DeviceType[]);
+const ACTIVE_DEVICE_TYPES: DeviceType[] = ["host","switch","hub"];
+const COMING_SOON_DEVICE_TYPES: DeviceType[] = ["computer","server","router","laptop"];
 type TopologyPreset="demo"|"star"|"bus"|"mesh";
 
 function deviceLabel(type:DeviceType):string{
   const m=DEVICE_META[type];
   return `${m.icon} ${type[0].toUpperCase()+type.slice(1)}`;
+}
+function normalizeDeviceType(type:string):DeviceType{
+  const t=String(type||"").toLowerCase();
+  if(t==="switch"||t==="hub"||t==="host") return t as DeviceType;
+  if(t==="computer"||t==="server"||t==="laptop"||t==="router"||t==="end_host") return "host";
+  return "host";
+}
+function toBackendDeviceType(type:DeviceType):string{
+  return type==="host" ? "end_host" : type;
 }
 
 function isLooseIPv4(s:string):boolean{
@@ -118,6 +129,34 @@ type PipelineSnapshot={
   signal?:{encoding?:string;sample_rate?:number};
   received?:Record<string,unknown>;
 };
+type DomainStats={broadcast_domains:number;collision_domains:number};
+type SwitchTableRow={mac:string;port:string;last_seen?:number};
+type SwitchTables=Record<string,SwitchTableRow[]>;
+type LearningRow={switch_id:string;mac:string;port:string;hop?:number;frame_kind?:string};
+type SwitchPortRow={port:string;neighbor:string;medium:string};
+type SwitchPorts=Record<string,SwitchPortRow[]>;
+function isEndpointDeviceType(t:DeviceType):boolean{
+  return normalizeDeviceType(t)==="host";
+}
+function learningSummaryText(rows:LearningRow[], devLabelFn:(id:string)=>string):string{
+  if(!rows.length) return "";
+  const bySwitch: Record<string, LearningRow[]> = {};
+  for(const r of rows){
+    const key=r.switch_id;
+    bySwitch[key] = bySwitch[key] || [];
+    bySwitch[key].push(r);
+  }
+  return Object.entries(bySwitch)
+    .map(([sw, list])=>{
+      const items=list
+        .slice()
+        .sort((a,b)=>(Number(a.hop??0)-Number(b.hop??0))||a.mac.localeCompare(b.mac))
+        .map(x=>`${x.mac}→${x.port}${x.hop!==undefined?`@h${x.hop}`:""}`)
+        .join(", ");
+      return `${devLabelFn(sw)}: ${items}`;
+    })
+    .join(" | ");
+}
 
 function buildPipeline(events:unknown[],mode:"physical"|"datalink",userData:string):PipelineSnapshot{
   const snap:PipelineSnapshot={mode,userData};
@@ -210,7 +249,7 @@ export default function SimulatorPage(){
   const [draggingType,setDraggingType]=useState<DeviceType|null>(null);
   const paletteDragRef=useRef<DeviceType|null>(null);
   const [placePickType,setPlacePickType]=useState<DeviceType|null>(null);
-  const [paletteDeviceType,setPaletteDeviceType]=useState<DeviceType>("computer");
+  const [paletteDeviceType,setPaletteDeviceType]=useState<DeviceType>("host");
   const [topologyHint,setTopologyHint]=useState<string>("");
   const [presetSelectKey,setPresetSelectKey]=useState(0);
   const [connectFrom,setConnectFrom]=useState<string|null>(null);
@@ -218,8 +257,8 @@ export default function SimulatorPage(){
   const [mousePos,setMousePos]=useState({x:0,y:0});
   const [ctxMenu,setCtxMenu]=useState<{x:number;y:number;devId:string}|null>(null);
   const [tooltip,setTooltip]=useState<{x:number;y:number;dev:DeviceNode}|null>(null);
-  const [animPkt,setAnimPkt]=useState<{x:number;y:number;vis:boolean;layer:string}>({x:0,y:0,vis:false,layer:"physical"});
-  const [activeLnk,setActiveLnk]=useState<string|null>(null);
+  const [animPkts,setAnimPkts]=useState<{id:string;x:number;y:number;layer:string}[]>([]);
+  const [activeLnkModes,setActiveLnkModes]=useState<Record<string,"flood"|"unicast"|null>>({});
   const [flashDev,setFlashDev]=useState<string|null>(null);
   const [log,setLog]=useState<{t:string;msg:string;layer:string}[]>([]);
   const [logFilter,setLogFilter]=useState("all");
@@ -230,6 +269,12 @@ export default function SimulatorPage(){
 
   const [pipeline,setPipeline]=useState<PipelineSnapshot|null>(null);
   const [showPipeline,setShowPipeline]=useState(true);
+  const [domainStats,setDomainStats]=useState<DomainStats|null>(null);
+  const [topologyMode,setTopologyMode]=useState(false);
+  const [switchTables,setSwitchTables]=useState<SwitchTables>({});
+  const [switchPorts,setSwitchPorts]=useState<SwitchPorts>({});
+  const [learningSummary,setLearningSummary]=useState<LearningRow[]>([]);
+  const [resetLearning,setResetLearning]=useState(false);
   const [editTarget,setEditTarget]=useState<DeviceNode|null>(null);
   const [editLabel,setEditLabel]=useState("");
   const [editIp,setEditIp]=useState("");
@@ -320,10 +365,15 @@ export default function SimulatorPage(){
     idSeq=0; lnkSeq=0;
     setConnectFrom(null); setCtxMenu(null); setLinkCtx(null); setPlacePickType(null);
     setTopologyHint("");
+    setDomainStats(null);
+    setTopologyMode(false);
+    setSwitchTables({});
+    setSwitchPorts({});
+    setLearningSummary([]);
 
     if(kind==="demo"){
-      const d1=mkDev("computer",130,195), d2=mkDev("switch",330,195);
-      const d3=mkDev("server",530,195), d4=mkDev("router",330,370);
+      const d1=mkDev("host",130,195), d2=mkDev("switch",330,195);
+      const d3=mkDev("host",530,195), d4=mkDev("hub",330,370);
       setDevices([d1,d2,d3,d4]);
       setLinks([
         {id:"lnk_1",src:d1.id,dst:d2.id,medium:"wired"},
@@ -339,7 +389,7 @@ export default function SimulatorPage(){
     if(kind==="star"){
       const cx=380, cy=220, r=130;
       const center=mkDev("switch",cx,cy);
-      const hostTypes:DeviceType[]=["computer","laptop","server","router"];
+      const hostTypes:DeviceType[]=["host","host","host","host"];
       const hosts=hostTypes.map((t,i)=>{
         const ang=(i/hostTypes.length)*2*Math.PI-Math.PI/2;
         return mkDev(t,cx+r*Math.cos(ang),cy+r*Math.sin(ang));
@@ -357,7 +407,7 @@ export default function SimulatorPage(){
 
     if(kind==="bus"){
       const y=220, gap=115, x0=120;
-      const chain:DeviceType[]=["computer","hub","switch","server","router"];
+      const chain:DeviceType[]=["host","hub","switch","host","host"];
       const nodes=chain.map((t,i)=>mkDev(t,x0+i*gap,y));
       setDevices(nodes);
       const L:NetworkLink[]=[];
@@ -372,8 +422,8 @@ export default function SimulatorPage(){
 
     /* mesh — full mesh of 4 end-capable nodes */
     const y1=160,y2=300,xl=200,xr=480;
-    const a=mkDev("computer",xl,y1), b=mkDev("laptop",xr,y1);
-    const c=mkDev("server",xl,y2), d=mkDev("router",xr,y2);
+    const a=mkDev("host",xl,y1), b=mkDev("host",xr,y1);
+    const c=mkDev("host",xl,y2), d=mkDev("host",xr,y2);
     setDevices([a,b,c,d]);
     const pairs:[string,string][]=[
       [a.id,b.id],[a.id,c.id],[a.id,d.id],[b.id,c.id],[b.id,d.id],[c.id,d.id],
@@ -385,9 +435,10 @@ export default function SimulatorPage(){
   }
 
   function mkDev(type:DeviceType,x:number,y:number):DeviceNode{
+    const normalized=normalizeDeviceType(type);
     const id="dev_"+(++idSeq);
-    return {id,type,x,y,layers:DEVICE_META[type].tcpip,
-      label:type[0].toUpperCase()+type.slice(1)+"-"+idSeq,
+    return {id,type:normalized,x,y,layers:DEVICE_META[normalized].tcpip,
+      label:normalized[0].toUpperCase()+normalized.slice(1)+"-"+idSeq,
       ip:"192.168.1."+(9+idSeq), mac:randMac()};
   }
 
@@ -403,9 +454,14 @@ export default function SimulatorPage(){
     const fromDt=isDeviceType(raw)?raw:null;
     const type=fromRef??fromDt??draggingType;
     if(!type)return;
+    const normalized=normalizeDeviceType(type);
+    if(!ACTIVE_DEVICE_TYPES.includes(normalized)){
+      setTopologyHint(`'${type}' is coming soon. Use host/switch/hub for now.`);
+      return;
+    }
     const r=canvasRef.current?.getBoundingClientRect();
     if(!r)return;
-    const dev=mkDev(type,e.clientX-r.left,e.clientY-r.top);
+    const dev=mkDev(normalized,e.clientX-r.left,e.clientY-r.top);
     setDevices(p=>{
       const next=[...p,dev];
       if(!srcId)setSrcId(dev.id);
@@ -454,11 +510,21 @@ export default function SimulatorPage(){
   }
 
   function getDevL(id:string,devs=devices):DeviceNode|undefined{return devs.find(d=>d.id===id);}
+  function devLabel(id:string):string{return getDevL(id)?.label ?? id;}
+  function isEndpointNodeId(id:string|null):boolean{
+    if(!id) return false;
+    const d=getDevL(id);
+    return !!d&&isEndpointDeviceType(d.type);
+  }
+  function portCountFor(id:string,lnkList=links):number{
+    return lnkList.filter(l=>l.src===id||l.dst===id).length;
+  }
 
   function simulateDisabledReason():string|undefined{
     if(running) return "Simulation is still running.";
     if(!srcId||!dstId) return "Set SRC and DST: right-click a device → Set as Source / Destination.";
     if(srcId===dstId) return "Source and destination must be different devices.";
+    if(!isEndpointNodeId(srcId)||!isEndpointNodeId(dstId)) return "SRC and DST must be end devices (computer/server/laptop/router), not switch/hub.";
     if(!getPath(srcId,dstId)) return "No route: connect SRC and DST with one or more links.";
     return undefined;
   }
@@ -475,7 +541,7 @@ export default function SimulatorPage(){
     }return null;
   }
 
-  function canSim(){return !!(srcId&&dstId&&srcId!==dstId&&!running&&getPath(srcId,dstId));}
+  function canSim(){return !!(srcId&&dstId&&srcId!==dstId&&!running&&isEndpointNodeId(srcId)&&isEndpointNodeId(dstId)&&getPath(srcId,dstId));}
 
   /** PHY medium for API: first segment on SRC→DST path (single-hop model). */
   function firstHopMedium(lnkList=links):MediumType{
@@ -535,6 +601,8 @@ export default function SimulatorPage(){
     if(!canSim())return;
     const path=getPath(srcId!,dstId!)!;
     const phyMedium=firstHopMedium();
+    let backendEvents: SimEvent[] = [];
+    let latestSwitchPorts: SwitchPorts = switchPorts;
     setPipeline(null);
     setRunning(true); setSimRunning(true); clearEvents();
     const src=getDevL(srcId!)!, dst=getDevL(dstId!)!;
@@ -553,6 +621,9 @@ export default function SimulatorPage(){
         clock_rate:clockRate, samples_per_bit:samplesPerBit,
         medium_kwargs:berF>0?{ber:berF}:{},
         collision_prob:colProb, link_error_rate:berF, inject_error:injectErr,
+        topology_devices: devices.map(d=>({id:d.id,type:toBackendDeviceType(d.type),label:d.label,mac:d.mac,ip:d.ip})),
+        topology_links: links.map(l=>({id:l.id,src:l.src,dst:l.dst,medium:l.medium})),
+        reset_learning: resetLearning,
       }:{
         session_id:sessionId, src_device_id:srcId!, dst_device_id:dstId!,
         bit_string:msg.replace(/[^01]/g,""), encoding, medium:phyMedium,
@@ -565,16 +636,61 @@ export default function SimulatorPage(){
       if(resp.ok){
         setRestOk(true);
         const data=await resp.json();
-        setPipeline(buildPipeline(data.events??[],simMode,simMode==="datalink"?msg:msg.replace(/[^01]/g,"")));
+        backendEvents=Array.isArray(data.events)?(data.events as SimEvent[]):[];
+        setTopologyMode(!!data.topology_mode);
+        if(data.domain_stats){
+          setDomainStats({
+            broadcast_domains:Number(data.domain_stats.broadcast_domains??0),
+            collision_domains:Number(data.domain_stats.collision_domains??0),
+          });
+        } else {
+          setDomainStats(null);
+        }
+        setSwitchTables((data.switch_tables??{}) as SwitchTables);
+        latestSwitchPorts=(data.switch_ports??{}) as SwitchPorts;
+        setSwitchPorts(latestSwitchPorts);
+        setLearningSummary(Array.isArray(data.learning_summary)?data.learning_summary as LearningRow[]:[]);
+        if(resetLearning) setResetLearning(false);
+        setPipeline(buildPipeline(backendEvents,simMode,simMode==="datalink"?msg:msg.replace(/[^01]/g,"")));
         addLog(`Backend: ${data.events_emitted} events`,"engine");
-        for(const ev of(data.events||[])){
+        if(data.domain_stats){
+          addLog(
+            `Domains → broadcast=${data.domain_stats.broadcast_domains} · collision=${data.domain_stats.collision_domains}`,
+            "engine",
+          );
+        }
+        if(Array.isArray(data.learning_summary)&&data.learning_summary.length){
+          const learned=learningSummaryText(data.learning_summary as LearningRow[],devLabel);
+          addLog(`Learning: ${learned}`,"datalink");
+        }
+        for(const ev of backendEvents){
           const l=EVT_LAYER[ev.event_type]||ev.layer||"engine";
           const h=ev.pdu?.headers||{};
           if(h.steps&&Array.isArray(h.steps)){
             for(const s of(h.steps as string[]).slice(0,4)) addLog(`  ${s}`,l);
           } else {
-            let detail=ev.event_type;
-            if(h.scheme) detail+=` [${h.scheme}]`;
+            let detail:string=ev.event_type;
+            if(h.forwarding_mode==="flood"){
+              const srcId=String(ev.src_device??"");
+              const egress=Array.isArray(h.egress_ports)?(h.egress_ports as string[]):[];
+              const portRows=latestSwitchPorts[srcId]||[];
+              const targetNames=egress.map(p=>{
+                const row=portRows.find(r=>r.port===p);
+                return row?devLabel(row.neighbor):p;
+              }).filter(Boolean);
+              const viaText=targetNames.length?` -> ${targetNames.join(", ")}`:"";
+              detail=`BROADCAST ${String(h.frame_kind??"frame").toUpperCase()}${viaText}`.trim();
+            } else if(h.forwarding_mode==="unicast"){
+              const srcId=String(ev.src_device??"");
+              const egress=Array.isArray(h.egress_ports)?(h.egress_ports as string[]):[];
+              const portRows=latestSwitchPorts[srcId]||[];
+              const targetNames=egress.map(p=>{
+                const row=portRows.find(r=>r.port===p);
+                return row?devLabel(row.neighbor):p;
+              }).filter(Boolean);
+              const viaText=targetNames.length?` -> ${targetNames.join(", ")}`:"";
+              detail=`UNICAST ${String(h.frame_kind??"frame").toUpperCase()}${viaText}`.trim();
+            } else if(h.scheme) detail+=` [${h.scheme}]`;
             else if(h.protocol) detail+=` [${h.protocol}]`;
             else if(h.detail) detail+=`: ${h.detail}`;
             addLog(`[${l.toUpperCase().slice(0,3)}] ${detail}`,l);
@@ -587,6 +703,11 @@ export default function SimulatorPage(){
       }
     }catch(_){
       setRestOk(false);
+      setDomainStats(null);
+      setTopologyMode(false);
+      setSwitchTables({});
+      setSwitchPorts({});
+      setLearningSummary([]);
       addLog("Backend offline — frontend-only animation","engine");
     }
 
@@ -595,16 +716,79 @@ export default function SimulatorPage(){
     drawWave(bits,encoding);
     addLog(`[PHY] Signal drawn: ${encoding}`,"physical");
 
-    for(let i=0;i<path.length-1;i++){
-      const hs=path[i],hd=path[i+1];
-      const lnk=links.find(l=>(l.src===hs&&l.dst===hd)||(l.src===hd&&l.dst===hs));
-      if(lnk){ setActiveLnk(lnk.id); await animPkt2(hs,hd,simMode); setActiveLnk(null); }
-      const via=getDevL(hd)!;
-      addLog(`[PHY] Received at ${via.label}`,"physical");
-      if(simMode==="datalink"){
-        addLog(`[DLL] ${errCtrl.toUpperCase()} check · ${macProto} · ${flowCtrl}`,"datalink");
+    if(simMode==="datalink"&&backendEvents.length){
+      // Replay true backend forwarding edges so first-send flood is visible on canvas.
+      const modeByDecisionKey: Record<string,"flood"|"unicast"|null> = {};
+      const steps: {ts:number;from:string;to:string;linkId:string;mode:"flood"|"unicast"|null}[] = [];
+      for(const ev of backendEvents){
+        const h=ev.pdu?.headers||{};
+        const srcNode=String(ev.src_device??"");
+        const hop=Number(ev.timestamp??0);
+        const frameKind=String(h.frame_kind??"");
+        const k=`${srcNode}|${hop}|${frameKind}`;
+        if(h.forwarding_mode==="flood"||h.forwarding_mode==="unicast"){
+          modeByDecisionKey[k]=h.forwarding_mode as "flood"|"unicast";
+        }
+        const link=typeof h.link==="string"?String(h.link):"";
+        if(!link||frameKind!=="data") continue;
+        const [hs,hd]=link.split("->");
+        if(!hs||!hd) continue;
+        const lnk=links.find(l=>(l.src===hs&&l.dst===hd)||(l.src===hd&&l.dst===hs));
+        if(!lnk) continue;
+        steps.push({
+          ts:Number(ev.timestamp??0),
+          from:hs,
+          to:hd,
+          linkId:lnk.id,
+          mode:modeByDecisionKey[k]??null,
+        });
       }
-      await delay(120);
+
+      let i=0;
+      while(i<steps.length){
+        const ts=steps[i].ts;
+        const batch: typeof steps = [];
+        while(i<steps.length&&steps[i].ts===ts){
+          batch.push(steps[i]);
+          i++;
+        }
+        setActiveLnkModes(prev=>{
+          const next={...prev};
+          for(const s of batch) next[s.linkId]=s.mode;
+          return next;
+        });
+        await Promise.all(batch.map(s=>animPkt2(s.from,s.to,simMode)));
+        setActiveLnkModes(prev=>{
+          const next={...prev};
+          for(const s of batch) delete next[s.linkId];
+          return next;
+        });
+        for(const s of batch){
+          const via=getDevL(s.to);
+          if(via) addLog(`[PHY] Received at ${via.label}`,"physical");
+        }
+        await delay(80);
+      }
+    } else {
+      for(let i=0;i<path.length-1;i++){
+        const hs=path[i],hd=path[i+1];
+        const lnk=links.find(l=>(l.src===hs&&l.dst===hd)||(l.src===hd&&l.dst===hs));
+        if(lnk){
+          setActiveLnkModes(prev=>({...prev,[lnk.id]:null}));
+          await animPkt2(hs,hd,simMode);
+          setActiveLnkModes(prev=>{
+            const next={...prev};
+            delete next[lnk.id];
+            return next;
+          });
+        }
+        const via=getDevL(hd)!;
+        addLog(`[PHY] Received at ${via.label}`,"physical");
+        if(simMode==="datalink"){
+          addLog(`[DLL] ${errCtrl.toUpperCase()} check · ${macProto} · ${flowCtrl}`,"datalink");
+        }
+        await delay(120);
+      }
     }
 
     addLog(`✓ Delivered to ${dst.label}`,"engine");
@@ -616,12 +800,18 @@ export default function SimulatorPage(){
   async function animPkt2(fromId:string,toId:string,mode:string){
     const from=getDevL(fromId)!, to=getDevL(toId)!;
     const layer=mode==="datalink"?"datalink":"physical";
+    const id=`pkt-${fromId}-${toId}-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
     for(let i=0;i<=44;i++){
       const f=i/44;
-      setAnimPkt({x:from.x+(to.x-from.x)*f, y:from.y+(to.y-from.y)*f, vis:true, layer});
+      const x=from.x+(to.x-from.x)*f;
+      const y=from.y+(to.y-from.y)*f;
+      setAnimPkts(prev=>{
+        const others=prev.filter(p=>p.id!==id);
+        return [...others,{id,x,y,layer}];
+      });
       await delay(11);
     }
-    setAnimPkt(p=>({...p,vis:false}));
+    setAnimPkts(prev=>prev.filter(p=>p.id!==id));
   }
 
   function drawWave(bits:number[],enc:string){
@@ -755,7 +945,7 @@ export default function SimulatorPage(){
           <div style={{width:8,height:8,borderRadius:"50%",background:"#34d399",
             boxShadow:"0 0 10px #34d399"}}/>
           <span style={{color:"#34d399",fontWeight:700,fontSize:15,letterSpacing:3}}>NETSIM</span>
-          <span style={{fontSize:9,color:UI.textSoft,marginLeft:2}}>v2 · TCP/IP</span>
+          <span style={{fontSize:9,color:UI.textSoft,marginLeft:2}}> TCP/IP</span>
         </div>
         <Div/>
 
@@ -814,6 +1004,27 @@ export default function SimulatorPage(){
             background:showAdvanced?rgba("#a78bfa",.1):"transparent",
           }}>◇ Advanced</button>
         <Div/>
+        <span style={{fontSize:10,color:"#374151"}}>SRC:</span>
+        <select value={srcId??""}
+          onChange={e=>setSrcId(e.target.value||null)}
+          style={{...selSt,width:120}}
+          title="Source device">
+          <option value="">(select)</option>
+          {devices.filter(d=>isEndpointDeviceType(d.type)).map(d=><option key={d.id} value={d.id}>{d.label}</option>)}
+        </select>
+        <button type="button" onClick={()=>{
+          if(!srcId||!dstId)return;
+          setSrcId(dstId); setDstId(srcId);
+        }} style={{...pill,padding:"3px 8px"}} title="Swap source and destination">⇄</button>
+        <span style={{fontSize:10,color:"#374151"}}>DST:</span>
+        <select value={dstId??""}
+          onChange={e=>setDstId(e.target.value||null)}
+          style={{...selSt,width:120}}
+          title="Destination device">
+          <option value="">(select)</option>
+          {devices.filter(d=>isEndpointDeviceType(d.type)).map(d=><option key={d.id} value={d.id}>{d.label}</option>)}
+        </select>
+        <Div/>
 
         {/* send */}
         <button type="button" onClick={simulate} disabled={!canSim()}
@@ -831,6 +1042,9 @@ export default function SimulatorPage(){
             {simBlockReason}
           </span>
         )}
+        <span style={{fontSize:9,color:"#6b7280"}}>
+          Link highlight: <span style={{color:"#f59e0b"}}>flood</span> / <span style={{color:"#22c55e"}}>unicast</span>
+        </span>
 
         <div style={{flex:1}}/>
         <Div/>
@@ -975,6 +1189,21 @@ export default function SimulatorPage(){
               </div>
             </div>
           </div>
+          <div style={{
+            minWidth:260,
+            maxWidth:380,
+            border:`1px solid ${UI.border}`,
+            borderRadius:6,
+            padding:"7px 9px",
+            background:UI.panel2,
+          }}>
+            <div style={{fontSize:10,color:"#374151",fontWeight:600,marginBottom:4}}>MAC realism notes</div>
+            <div style={{fontSize:9,color:UI.textSoft,lineHeight:1.4}}>
+              CSMA/CD, CSMA/CA and ALOHA are simulated as protocol-level steps with collision probability and
+              retransmission/backoff events, not full PHY timing propagation. Great for learning access behavior,
+              but not a bit-accurate Ethernet/Wi-Fi physical emulation.
+            </div>
+          </div>
         </div>
       )}
 
@@ -998,9 +1227,14 @@ export default function SimulatorPage(){
             onClick={(e)=>{
               setCtxMenu(null); setLinkCtx(null);
               if(placePickType){
+                const normalized=normalizeDeviceType(placePickType);
+                if(!ACTIVE_DEVICE_TYPES.includes(normalized)){
+                  setTopologyHint(`'${placePickType}' is coming soon. Use host/switch/hub for now.`);
+                  return;
+                }
                 const r=canvasRef.current?.getBoundingClientRect();
                 if(!r)return;
-                const dev=mkDev(placePickType,e.clientX-r.left,e.clientY-r.top);
+                const dev=mkDev(normalized,e.clientX-r.left,e.clientY-r.top);
                 setDevices(p=>{
                   const next=[...p,dev];
                   if(!srcId)setSrcId(dev.id);
@@ -1040,8 +1274,13 @@ export default function SimulatorPage(){
                 const s=getDevL(lnk.src),d=getDevL(lnk.dst);
                 if(!s||!d)return null;
                 const isWired=lnk.medium==="wired";
-                const active=lnk.id===activeLnk;
-                const clr=active?"#34d399":isWired?"#60a5fa":"#fb923c";
+                const active=Object.prototype.hasOwnProperty.call(activeLnkModes,lnk.id);
+                const linkMode=active?activeLnkModes[lnk.id]:null;
+                const activeClr=
+                  linkMode==="flood" ? "#f59e0b" :
+                  linkMode==="unicast" ? "#22c55e" :
+                  "#34d399";
+                const clr=active?activeClr:isWired?"#60a5fa":"#fb923c";
                 const sw=active?4:2.8;
                 const op=active?1:0.88;
                 return(
@@ -1080,18 +1319,18 @@ export default function SimulatorPage(){
                 );
               })()}
 
-              {animPkt.vis&&(()=>{
-                const clr=LAYER_CLR[animPkt.layer]||"#34d399";
+              {animPkts.map(pkt=>{
+                const clr=LAYER_CLR[pkt.layer]||"#34d399";
                 return(
-                  <g transform={`translate(${animPkt.x},${animPkt.y})`}>
+                  <g key={pkt.id} transform={`translate(${pkt.x},${pkt.y})`}>
                     <circle r={11} fill={clr} opacity={0.92}
                       style={{filter:`drop-shadow(0 0 10px ${clr})`}}/>
                     <text textAnchor="middle" y={4} fontSize={8} fill="#000" fontWeight="bold">
-                      {animPkt.layer==="datalink"?"FRM":"BIT"}
+                      {pkt.layer==="datalink"?"FRM":"BIT"}
                     </text>
                   </g>
                 );
-              })()}
+              })}
             </svg>
 
             {/* Wide transparent strokes for right-click link editing (under device nodes) */}
@@ -1163,6 +1402,10 @@ export default function SimulatorPage(){
                     if(connectFrom&&connectFrom!==dev.id){
                       addLink(connectFrom,dev.id,pendingMed);
                       setConnectFrom(null);
+                      return;
+                    }
+                    if(!connectFrom&&dev.type==="switch"){
+                      addLog(`Switch ${dev.label}: ${portCountFor(dev.id)} port(s) connected`,"engine");
                     }
                   }}
                   onContextMenu={e=>{
@@ -1214,6 +1457,7 @@ export default function SimulatorPage(){
                 <div style={{color:UI.textMuted}}>IP: <span style={{color:"#2563eb"}}>{tooltip.dev.ip}</span></div>
                 <div style={{color:UI.textMuted}}>MAC: <span style={{color:"#7c3aed",fontSize:10}}>{tooltip.dev.mac}</span></div>
                 <div style={{color:UI.textMuted}}>TCP/IP: <span style={{color:"#059669"}}>layers 0–{tooltip.dev.layers}</span></div>
+                <div style={{color:UI.textMuted}}>Ports: <span style={{color:"#0f766e"}}>{portCountFor(tooltip.dev.id)}</span></div>
                 {tooltip.dev.id===srcId&&<div style={{color:"#34d399",marginTop:3}}>📤 SOURCE</div>}
                 {tooltip.dev.id===dstId&&<div style={{color:"#f87171",marginTop:3}}>📥 DESTINATION</div>}
               </div>
@@ -1244,11 +1488,21 @@ export default function SimulatorPage(){
                 }}/>
                 <CtxSep/>
                 <CtxItem label="📤 Set as Source" color="#34d399" action={()=>{
+                  if(!isEndpointNodeId(ctxMenu.devId)){
+                    addLog("Only end devices can be Source.","engine");
+                    setCtxMenu(null);
+                    return;
+                  }
                   setSrcId(ctxMenu.devId);
                   addLog(`Source → ${getDevL(ctxMenu.devId)?.label}`,"engine");
                   setCtxMenu(null);
                 }}/>
                 <CtxItem label="📥 Set as Destination" color="#f87171" action={()=>{
+                  if(!isEndpointNodeId(ctxMenu.devId)){
+                    addLog("Only end devices can be Destination.","engine");
+                    setCtxMenu(null);
+                    return;
+                  }
                   setDstId(ctxMenu.devId);
                   addLog(`Dest → ${getDevL(ctxMenu.devId)?.label}`,"engine");
                   setCtxMenu(null);
@@ -1487,16 +1741,22 @@ export default function SimulatorPage(){
               <span style={{fontSize:22,lineHeight:1}} aria-hidden>{DEVICE_META[paletteDeviceType].icon}</span>
               <select value={paletteDeviceType}
                 onChange={e=>{
-                  const t=e.target.value as DeviceType;
+                  const t=normalizeDeviceType(e.target.value as DeviceType);
                   setPaletteDeviceType(t);
                   setPlacePickType(t);
                 }}
                 style={{...selSt,flex:1,minWidth:0}}
                 aria-label="Device type to place">
-                {DEVICE_TYPES.map(t=>(
+                {ACTIVE_DEVICE_TYPES.map(t=>(
                   <option key={t} value={t}>{deviceLabel(t)}</option>
                 ))}
+                {COMING_SOON_DEVICE_TYPES.map(t=>(
+                  <option key={t} value={t} disabled>{deviceLabel(t)} (coming soon)</option>
+                ))}
               </select>
+            </div>
+            <div style={{marginTop:7,fontSize:9,color:UI.textSoft}}>
+              Supported now: <span style={{color:UI.text}}>host, switch, hub</span>
             </div>
             {placePickType&&(
               <div style={{fontSize:9,color:"#059669",marginTop:6,lineHeight:1.35}}>
@@ -1554,18 +1814,94 @@ export default function SimulatorPage(){
             )}
           </SideSection>
 
-          {/* event log */}
-          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",
-            borderTop:"1px solid #cbd5e1"}}>
-            <div style={{padding:"6px 10px 3px",display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
-              <span style={{fontSize:9,letterSpacing:1.5,color:"#374151",textTransform:"uppercase",flex:1}}>
-                Event Log ({filtLog.length})
+          <SideSection title="ITL351 Matrix">
+            <div style={{display:"grid",gap:4,fontSize:10,color:UI.textMuted}}>
+              {[
+                ["Topology editor + send/receive","done"],
+                ["PHY encoding + waveform","done"],
+                ["DLL error/access/flow protocols","done"],
+                ["Switch learning + unknown flood","done"],
+                ["Topology-aware backend forwarding",topologyMode?"done":"ready"],
+                ["Broadcast/collision domain counts",domainStats?"done":"ready"],
+              ].map(([name,state])=>(
+                <div key={name} style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{color:state==="done"?"#059669":"#b45309"}}>{state==="done"?"✓":"•"}</span>
+                  <span>{name}</span>
+                </div>
+              ))}
+            </div>
+            {domainStats&&(
+              <div style={{marginTop:8,fontSize:10,color:UI.textSoft}}>
+                Domains: BD {domainStats.broadcast_domains} · CD {domainStats.collision_domains}
+              </div>
+            )}
+          </SideSection>
+
+          <SideSection title="Switch MAC Tables">
+            <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}>
+              <button
+                type="button"
+                onClick={()=>{
+                  setResetLearning(true);
+                  setSwitchTables({});
+                  setLearningSummary([]);
+                  addLog("MAC learning tables scheduled for reset on next simulate.","engine");
+                }}
+                style={{...pill,padding:"3px 8px",fontSize:10}}
+                title="Reset persistent switch learning tables"
+              >
+                Reset tables
+              </button>
+              <span style={{fontSize:9,color:UI.textSoft}}>
+                {topologyMode?"Persistent across runs":"Topology mode off"}
               </span>
+            </div>
+            {Object.keys(switchPorts).length===0?(
+              <div style={{fontSize:10,color:UI.textSoft}}>No learned switch entries yet.</div>
+            ):(
+              <div style={{display:"grid",gap:8}}>
+                {Object.entries(switchPorts).map(([sw,ports])=>(
+                  <div key={sw} style={{border:`1px solid ${UI.border}`,borderRadius:6,padding:6}}>
+                    <div style={{fontSize:10,color:"#0f766e",marginBottom:4,fontWeight:600}}>
+                      {devLabel(sw)}
+                    </div>
+                    {ports.length===0?(
+                      <div style={{fontSize:9,color:UI.textSoft}}>empty</div>
+                    ):(
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",rowGap:3,columnGap:8,fontSize:9,color:UI.textMuted}}>
+                        <span style={{color:UI.textSoft}}>Port</span>
+                        <span style={{color:UI.textSoft}}>Neighbor</span>
+                        <span style={{color:UI.textSoft}}>Learned MAC</span>
+                        {ports.map((p,idx)=>{
+                          const mac=(switchTables[sw]||[]).find(r=>r.port===p.port)?.mac ?? "—";
+                          return(
+                          <div key={`${sw}-${p.port}-${idx}`} style={{display:"contents"}}>
+                            <span style={{fontFamily:"monospace",color:"#0f766e"}}>{p.port.split(":").pop() ?? p.port}</span>
+                            <span style={{fontFamily:"monospace",color:UI.textSoft}}>{devLabel(p.neighbor)}</span>
+                            <span style={{fontFamily:"monospace",color:UI.text}}>{mac}</span>
+                          </div>
+                        );})}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {learningSummary.length>0&&(
+              <div style={{marginTop:8,fontSize:9,color:UI.textSoft}}>
+                Last learn: {learningSummaryText(learningSummary,devLabel)}
+              </div>
+            )}
+          </SideSection>
+
+          {/* event log */}
+          <SideSection title={`Event Log (${filtLog.length})`} defaultOpen={false} style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #cbd5e1"}}>
+            <div style={{padding:"0 0 3px",display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
               <button onClick={()=>setLog([])} style={{...pill,padding:"2px 7px",fontSize:9,color:"#374151"}}>
                 Clear
               </button>
             </div>
-            <div style={{display:"flex",gap:3,padding:"0 8px 5px",flexShrink:0,flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:3,padding:"0 0 5px",flexShrink:0,flexWrap:"wrap"}}>
               {["all","physical","datalink","network","transport","application","engine"].map(f=>{
                 const clr=LAYER_CLR[f]||"#34d399";
                 return(
@@ -1578,7 +1914,7 @@ export default function SimulatorPage(){
                 );
               })}
             </div>
-            <div style={{flex:1,overflowY:"auto",padding:"2px 8px",fontSize:10,lineHeight:1.55}}>
+            <div style={{flex:1,overflowY:"auto",padding:"2px 0",fontSize:10,lineHeight:1.55}}>
               {filtLog.map((e,i)=>(
                 <div key={i} style={{padding:"2px 4px",borderRadius:2,marginBottom:1,
                   color:LAYER_CLR[e.layer]||"#4b5563",opacity:i>60?0.55:1}}>
@@ -1591,7 +1927,7 @@ export default function SimulatorPage(){
                 </div>
               )}
             </div>
-          </div>
+          </SideSection>
         </div>
       </div>
 
@@ -1634,14 +1970,19 @@ export default function SimulatorPage(){
 
 /* ── helper components ──────────────────────────────────────────────────── */
 function Div(){return <div style={{width:1,height:22,background:UI.border,margin:"0 2px"}}/>;}
-function SideSection({title,hint,children}:{title:string;hint?:string;children:React.ReactNode}){
+function SideSection({title,hint,children,defaultOpen=true,style}:{title:string;hint?:string;children:React.ReactNode;defaultOpen?:boolean;style?:React.CSSProperties}){
+  const [open,setOpen]=useState(defaultOpen);
   return(
-    <div style={{borderBottom:`1px solid ${UI.border}`,padding:"9px 10px"}}>
-      <div style={{display:"flex",gap:5,alignItems:"baseline",marginBottom:7}}>
+    <div style={{borderBottom:`1px solid ${UI.border}`,padding:"9px 10px",...style}}>
+      <button type="button" onClick={()=>setOpen(o=>!o)} style={{
+        width:"100%",display:"flex",gap:6,alignItems:"baseline",marginBottom:open?7:0,
+        background:"transparent",border:"none",padding:0,cursor:"pointer",fontFamily:"inherit",textAlign:"left",
+      }}>
+        <span style={{fontSize:9,color:UI.textSoft,width:10,display:"inline-block"}}>{open?"▾":"▸"}</span>
         <span style={{fontSize:9,letterSpacing:1.5,color:UI.textMuted,textTransform:"uppercase"}}>{title}</span>
         {hint&&<span style={{fontSize:9,color:UI.textSoft}}>{hint}</span>}
-      </div>
-      {children}
+      </button>
+      {open&&children}
     </div>
   );
 }

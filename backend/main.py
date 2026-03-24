@@ -11,14 +11,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from devices.factory import DeviceFactory
 from layers.base import LayerPDU
 from layers.physical.factory import PhysicalLayerFactory
 from layers.physical.models import Bits
 from layers.datalink.factory import DataLinkLayerFactory
-from simulation.engine import SimulationEngine
 from simulation.events import SimEvent, EventType, LayerName, PDU, sim_event_to_dict, sim_event_to_json
-from websocket.emitter import ConnectionManager, WebSocketEmitter
+from simulation.topology_runtime import simulate_datalink_topology
+from websocket.emitter import ConnectionManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,6 +64,9 @@ class DataLinkSimReq(BaseModel):
     inject_error:   bool = False
     medium_kwargs:  Dict[str, Any] = {}
     mac_kwargs:     Dict[str, Any] = {}
+    topology_devices: List[Dict[str, Any]] = []
+    topology_links: List[Dict[str, Any]] = []
+    reset_learning: bool = False
 
 class DeviceConfigReq(BaseModel):
     device_id:   str; device_type: str = "end_host"
@@ -123,6 +125,26 @@ async def simulate_physical(req: PhysicalSimReq):
 
 @app.post("/api/simulate/datalink")
 async def simulate_datalink(req: DataLinkSimReq):
+    if req.topology_devices and req.topology_links:
+        sess = sessions.setdefault(req.session_id, {})
+        topo_events, domain_stats, switch_tables, learning_summary, switch_ports = simulate_datalink_topology(
+            req=req,
+            session_state=sess,
+        )
+        if ws_manager.connection_count > 0:
+            for e in topo_events:
+                asyncio.create_task(ws_manager.broadcast(sim_event_to_json(e)))
+        return {
+            "status": "ok",
+            "events_emitted": len(topo_events),
+            "events": [sim_event_to_dict(e) for e in topo_events],
+            "domain_stats": domain_stats,
+            "switch_tables": switch_tables,
+            "learning_summary": learning_summary,
+            "switch_ports": switch_ports,
+            "topology_mode": True,
+        }
+
     collected: List[SimEvent] = []
 
     class CollectObs:
@@ -162,7 +184,16 @@ async def simulate_datalink(req: DataLinkSimReq):
         "inject_error": req.inject_error,
     })
     dll.send_down(pdu)
-    return {"status":"ok","events_emitted":len(collected),"events":[sim_event_to_dict(e) for e in collected]}
+    return {
+        "status": "ok",
+        "events_emitted": len(collected),
+        "events": [sim_event_to_dict(e) for e in collected],
+        "domain_stats": {"broadcast_domains": 1, "collision_domains": 1},
+        "switch_tables": {},
+        "learning_summary": [],
+        "switch_ports": {},
+        "topology_mode": False,
+    }
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────

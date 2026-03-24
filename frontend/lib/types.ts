@@ -37,7 +37,7 @@ export interface SimEvent {
   meta:       Record<string, unknown>;
 }
 
-export type DeviceType = "computer" | "server" | "router" | "switch" | "hub" | "laptop";
+export type DeviceType = "host" | "switch" | "hub" | "computer" | "server" | "router" | "laptop";
 export type MediumType = "wired" | "wireless";
 
 export interface DeviceNode {
@@ -57,4 +57,16 @@ export interface NetworkLink {
   src:    string;
   dst:    string;
   medium: MediumType;
+}
+
+export interface SwitchTableEntry {
+  mac: string;
+  port: string;
+  last_seen?: number;
+}
+
+export interface LearningSummaryEntry {
+  switch_id: string;
+  mac: string;
+  port: string;
 }

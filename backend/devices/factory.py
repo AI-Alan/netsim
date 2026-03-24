@@ -10,7 +10,21 @@ from devices.base import NetworkDevice
 
 logger = logging.getLogger(__name__)
 
+# Composition-first role descriptors for topology runtime.
+# Runtime forwarding uses these semantic roles instead of class inheritance.
+DEVICE_ROLE: Dict[str, str] = {
+    "host": "host",
+    "end_host": "host",
+    "computer": "host",
+    "server": "host",
+    "laptop": "host",
+    "router": "router",
+    "switch": "switch",
+    "hub": "hub",
+}
+
 DEVICE_REGISTRY: Dict[str, type] = {
+    "host":     EndHost,
     "end_host": EndHost,
     "computer": EndHost,
     "server":   EndHost,
@@ -34,3 +48,7 @@ class DeviceFactory:
     @staticmethod
     def available_types() -> List[str]:
         return list(DEVICE_REGISTRY.keys())
+
+    @staticmethod
+    def role_for(device_type: str) -> str:
+        return DEVICE_ROLE.get(device_type.lower(), "host")
