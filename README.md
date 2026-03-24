@@ -1,63 +1,53 @@
 # NetSim v2.0 — Protocol-Accurate TCP/IP Network Simulator
 
-6th Semester Computer Networks Course Project  
-Stack: **Next.js 14 + TypeScript** (frontend) · **Python FastAPI** (backend) · **WebSockets**
+6th Semester Computer Networks — course project  
+**Stack:** **Next.js 14** + **TypeScript** (frontend) · **Python FastAPI** (backend) · **WebSockets**
+
+Formal submission specification: **[SPEC.md](SPEC.md)**.
 
 ---
 
-## What's implemented (Phase 1 + 2)
+## Current implementation (summary)
 
-### TCP/IP Layer Model
-Session + Presentation (OSI 5/6) are merged into the Application layer — matching the TCP/IP 4-layer model.
+### Live vs stub layers (TCP/IP model on screen)
 
-| TCP/IP Layer | OSI Equiv | Status | Protocols |
-|---|---|---|---|
-| Physical | 1 | ✅ LIVE | NRZ-L, NRZ-I, Manchester, Diff.Manchester, AMI, 4B5B |
-| Data Link | 2 | ✅ LIVE | Framing, Error Control, MAC, Flow Control |
-| Network | 3 | Stub | IP, Routing, TTL |
-| Transport | 4 | Stub | TCP state machine, UDP |
-| Application | 5/6/7 | Stub | HTTP, DNS, ICMP |
+| TCP/IP layer | Status | Notes |
+|----------------|--------|--------|
+| **Physical** | Live | Line encodings, signal generation, `BITS_SENT` / `SIGNAL_DRAWN` events |
+| **Data Link** | Live | Framing, error control, MAC/access, ARQ flow control; topology mode with switches/hubs |
+| **Network / Transport / Application** | Stub | Event types and UI placeholders; not full protocol stacks |
 
-### Data Link Sub-layers
-**Framing**
-- Fixed-size (N-byte pad/truncate)
-- Variable-size, bit-oriented (HDLC: 0x7E flag delimiter + byte stuffing)
+Session + Presentation (OSI 5–6) are folded into **Application** in the UI, matching a **4-layer TCP/IP** teaching model.
 
-**Error Control** (Strategy pattern)
-- `ChecksumErrorControl` — RFC-1071 Internet 16-bit checksum
-- `CRCErrorControl`      — IEEE 802.3 CRC-32 (zlib)
+### Backend capabilities
 
-**Access Control / MAC** (Strategy pattern)
-- `PureAloha`    — transmit immediately, random back-off on collision
-- `SlottedAloha` — wait for slot boundary
-- `CSMA`         — 1-persistent carrier sense
-- `CSMACD`       — CSMA + collision detect, binary exponential back-off (Ethernet)
-- `CSMACA`       — CSMA + collision avoid, DIFS/SIFS/CW, optional RTS/CTS (802.11)
+- **REST:** `GET /health`, `GET /api/encodings`, `GET /api/media`, `GET /api/datalink/options`
+- **Simulation:** `POST /api/simulate/physical` (bit string), `POST /api/simulate/datalink` (message + DLL options)
+- **Topology mode:** When `topology_devices` + `topology_links` are sent with a datalink request, **`simulate_datalink_topology`** runs: host routing, **switch learning** (MAC → port), **unknown unicast flood**, hub flood, **persistent switch tables** per session, **broadcast/collision domain** counts, learning summary for the UI
+- **WebSocket:** `GET ws://…/ws/{session_id}` — broadcasts `SimEvent` JSON when clients are connected during a run
 
-**Flow Control / ARQ** (Strategy pattern)
-- `StopAndWaitARQ`    — window=1, ACK each frame
-- `GoBackNARQ`        — configurable window, retransmit from error
-- `SelectiveRepeatARQ`— configurable window, retransmit only errored frame
+### Data link (educational)
 
-All MAC and ARQ protocols return full step-by-step educational logs streamed to the UI.
+- **Framing:** fixed-size; variable (HDLC-style flag + byte stuffing)
+- **Error control:** CRC-32, checksum, none; optional inject-error for demos
+- **MAC:** Pure/slotted ALOHA, CSMA, CSMA/CD, CSMA/CA (stepwise logs, not full PHY timing)
+- **Flow / ARQ:** stop-and-wait, Go-Back-N, selective repeat
 
----
+### Design patterns (backend)
 
-## Design Patterns Used
 | Pattern | Where |
-|---|---|
-| **Strategy** | IEncodingStrategy, ITransmissionMedium, IFraming, IErrorControl, IMACProtocol, IFlowControl, IAppProtocol |
-| **Template Method** | PhysicalLayer, DataLinkLayer, NetworkLayer, TransportLayer, ApplicationLayer |
-| **Observer** | ILayerObserver → WebSocketEmitter broadcasts SimEvents |
-| **Factory Method** | PhysicalLayerFactory, DataLinkLayerFactory, DeviceFactory |
-| **Value Object** | Bits, Signal, EthernetFrame, IPPacket, ARPPacket |
-| **State Machine** | TCPStateMachine (CLOSED→SYN_SENT→ESTABLISHED→…) |
+|--------|--------|
+| **Strategy** | Encoding, medium, framing, error control, MAC, flow |
+| **Template method** | Layer classes |
+| **Observer** | Layer → `SimEvent` → WebSocket |
+| **Factory** | Physical / data link / device factories |
 
 ---
 
-## Running
+## Running locally
 
 ### Backend
+
 ```bash
 cd backend
 pip install -r requirements.txt
@@ -65,29 +55,54 @@ uvicorn main:app --reload --port 8000
 ```
 
 ### Frontend
+
 ```bash
 cd frontend
 npm install
-npm run dev   # → http://localhost:3000/simulator
+npm run dev
+```
+
+Open **http://localhost:3000** (landing) or **http://localhost:3000/simulator** (simulator).
+
+### Environment (optional)
+
+| Variable | Default |
+|----------|---------|
+| `NEXT_PUBLIC_BACKEND_URL` | `http://localhost:8000` |
+| `NEXT_PUBLIC_WS_URL` | `ws://localhost:8000` |
+
+### Tests
+
+```bash
+# Backend
+cd backend && pytest
+
+# Frontend (Vitest)
+cd frontend && npm test
 ```
 
 ---
 
-## UI Features
-- **Topology canvas** — drag devices from palette, place anywhere
-- **Wired vs Wireless** — solid blue lines (wired) vs dashed orange lines (wireless), visual distinction in both links and labels
-- **Resizable panels** — sidebar (drag left edge ↔), waveform panel (drag top ↕)
-- **PHY / PHY+DLL mode toggle** — switch between physical-only and full data link simulation
-- **DLL Config panel** — toggle with ⚙ button; configure all 4 sublayers independently
-- **Layer flash** — TCP/IP stack sidebar highlights the active layer in real time
-- **Event log** — per-layer filter (PHY/DLL/NET/TRA/APP/ENG), scrollable, 200 entries
-- **Waveform** — live D3-rendered signal with glow, resizable height
-- **Right-click menu** — connect (choose wired/wireless), set src/dst, delete
-- **Error injection** — toggle "Inject Error" in DLL Config to demo CRC/Checksum detection
+## UI features (current)
+
+- **Topology canvas** — drag device type from palette or click-to-place; wired (solid) vs wireless (dashed) links
+- **Presets** — demo / star / bus / mesh; clear canvas
+- **Modes** — PHY-only vs PHY + DLL; **DLL config** panel (toggle); **Advanced** (clock Hz, samples/bit, quick lab presets)
+- **Resizable panels** — sidebar width, waveform panel height
+- **Waveform** — **Canvas 2D** plot of encoded signal (from `encodeSignal` / PHY events)
+- **Event log** — layer filters, collapsible section
+- **Switch MAC tables** — per-switch port/MAC view; scrollable list when many switches; reset learning + topology fingerprint behavior from backend
+- **Overlays** — device tooltip and context menus stack above top bars so properties are not hidden behind encoding/config UI
+- **Status** — API / WebSocket connectivity indicators in the top bar
 
 ---
 
-## WebSocket Contract (unchanged)
-Backend emits `SimEvent` JSON on every layer action.  
-New event types added in v2: `FRAMING_INFO`, `ERROR_DETECTED`, `ACCESS_CONTROL`, `FLOW_CONTROL`, `ACK_SENT`, `SESSION_INFO`, `APP_ENCODING`.  
-Frontend handles all types via the event log and layer highlight system.
+## WebSocket / event contract
+
+Backend emits **`SimEvent`** JSON for layer actions. Types include `FRAMING_INFO`, `ERROR_DETECTED`, `ACCESS_CONTROL`, `FLOW_CONTROL`, `SESSION_INFO`, and standard frame/PHY events. The frontend stores and displays them in the event log and pipeline view.
+
+---
+
+## Troubleshooting
+
+- **`fetch failed` / `ENOTFOUND registry.npmjs.org` on `npm run dev`:** Next.js may try to reach the npm registry during dev startup. If DNS/network fails, you may see a stack trace; the server often still reports **Ready**. Fix network/DNS or ignore if the app loads at localhost.

@@ -929,6 +929,9 @@ export default function SimulatorPage(){
 
   const filtLog=logFilter==="all"?log:log.filter(e=>e.layer===logFilter);
   const simBlockReason=simulateDisabledReason();
+  const canvasRect=canvasRef.current?.getBoundingClientRect();
+  const overlayBaseX=canvasRect?.left??0;
+  const overlayBaseY=canvasRect?.top??0;
 
   /* ── RENDER ─────────────────────────────────────────────────────────── */
   return (
@@ -1446,9 +1449,9 @@ export default function SimulatorPage(){
 
             {/* tooltip */}
             {tooltip&&(
-              <div style={{position:"absolute",left:tooltip.x,top:tooltip.y,
+              <div style={{position:"fixed",left:overlayBaseX+tooltip.x,top:overlayBaseY+tooltip.y,
                 background:UI.panel,border:`1px solid ${UI.borderHi}`,borderRadius:8,
-                padding:"10px 14px",fontSize:11,pointerEvents:"none",zIndex:200,
+                padding:"10px 14px",fontSize:11,pointerEvents:"none",zIndex:1200,
                 lineHeight:1.9,boxShadow:"0 8px 28px rgba(15,23,42,0.12)",minWidth:185}}>
                 <div style={{color:DEVICE_META[tooltip.dev.type].color,fontWeight:700,marginBottom:3}}>
                   {tooltip.dev.label}
@@ -1465,9 +1468,9 @@ export default function SimulatorPage(){
 
             {/* context menu */}
             {ctxMenu&&(
-              <div style={{position:"absolute",left:ctxMenu.x,top:ctxMenu.y,
+              <div style={{position:"fixed",left:overlayBaseX+ctxMenu.x,top:overlayBaseY+ctxMenu.y,
                 background:UI.panel,border:`1px solid ${UI.borderHi}`,borderRadius:9,
-                padding:4,zIndex:300,minWidth:210,boxShadow:"0 8px 28px rgba(15,23,42,0.15)"}}
+                padding:4,zIndex:1300,minWidth:210,boxShadow:"0 8px 28px rgba(15,23,42,0.15)"}}
                 onClick={e=>e.stopPropagation()}>
                 <div style={{padding:"3px 10px 5px",color:UI.textSoft,fontSize:10,letterSpacing:1}}>
                   CONNECT USING
@@ -1518,9 +1521,9 @@ export default function SimulatorPage(){
               const lk=links.find(l=>l.id===linkCtx.linkId);
               const a=lk?getDevL(lk.src):undefined,b=lk?getDevL(lk.dst):undefined;
               return(
-                <div style={{position:"absolute",left:linkCtx.x,top:linkCtx.y,
+                <div style={{position:"fixed",left:overlayBaseX+linkCtx.x,top:overlayBaseY+linkCtx.y,
                   background:UI.panel,border:`1px solid ${UI.borderHi}`,borderRadius:9,
-                  padding:4,zIndex:300,minWidth:200,boxShadow:"0 8px 28px rgba(15,23,42,0.15)"}}
+                  padding:4,zIndex:1300,minWidth:200,boxShadow:"0 8px 28px rgba(15,23,42,0.15)"}}
                   onClick={e=>e.stopPropagation()}>
                   <div style={{padding:"3px 10px 5px",color:UI.textSoft,fontSize:10,letterSpacing:1}}>
                     LINK · {a?.label??"?"} ↔ {b?.label??"?"}
@@ -1859,7 +1862,7 @@ export default function SimulatorPage(){
             {Object.keys(switchPorts).length===0?(
               <div style={{fontSize:10,color:UI.textSoft}}>No learned switch entries yet.</div>
             ):(
-              <div style={{display:"grid",gap:8}}>
+              <div style={{display:"grid",gap:8,maxHeight:280,overflowY:"auto",paddingRight:2}}>
                 {Object.entries(switchPorts).map(([sw,ports])=>(
                   <div key={sw} style={{border:`1px solid ${UI.border}`,borderRadius:6,padding:6}}>
                     <div style={{fontSize:10,color:"#0f766e",marginBottom:4,fontWeight:600}}>
@@ -1933,7 +1936,7 @@ export default function SimulatorPage(){
 
       {editTarget&&(
         <div role="dialog" aria-modal="true" aria-labelledby="device-edit-title"
-          style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:500,
+          style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:2000,
             display:"flex",alignItems:"center",justifyContent:"center"}}
           onClick={()=>{setEditTarget(null);setEditErr("");}}>
           <div style={{
