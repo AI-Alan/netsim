@@ -12,6 +12,8 @@ import {
   labelDatalinkOption,
   type DatalinkApiOptions,
 } from "@/lib/api";
+import { toBackendDeviceType } from "@/lib/topologyDomainStats";
+import { useTopologyDomainStats } from "@/lib/useTopologyDomainStats";
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const WS_URL  = process.env.NEXT_PUBLIC_WS_URL      ?? "ws://localhost:8000";
@@ -54,6 +56,16 @@ const EVT_LAYER: Record<string,string> = {
 let idSeq=0, lnkSeq=0;
 const randMac=()=>Array.from({length:6},()=>Math.floor(Math.random()*256).toString(16).padStart(2,"0")).join(":");
 const delay=(ms:number)=>new Promise(r=>setTimeout(r,ms));
+const MAX_EXTRA_FLOWS=5;
+const FLOW_ANIM_COLORS=["#f59e0b","#22c55e","#3b82f6","#a855f7","#ec4899","#14b8a6"] as const;
+
+type ExtraFlow={src:string;dst:string;msg:string;startSlot:string};
+type TrafficFlowPayload={
+  src_device_id:string;
+  dst_device_id:string;
+  message:string;
+  start_slot:number;
+};
 const rgba=(hex:string,a:number)=>{
   const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
   return `rgba(${r},${g},${b},${a})`;
@@ -104,10 +116,6 @@ function normalizeDeviceType(type:string):DeviceType{
   if(t==="computer"||t==="server"||t==="laptop"||t==="router"||t==="end_host") return "host";
   return "host";
 }
-function toBackendDeviceType(type:DeviceType):string{
-  return type==="host" ? "end_host" : type;
-}
-
 function isLooseIPv4(s:string):boolean{
   const m=s.trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if(!m)return false;
@@ -129,7 +137,6 @@ type PipelineSnapshot={
   signal?:{encoding?:string;sample_rate?:number};
   received?:Record<string,unknown>;
 };
-type DomainStats={broadcast_domains:number;collision_domains:number};
 type SwitchTableRow={mac:string;port:string;last_seen?:number};
 type SwitchTables=Record<string,SwitchTableRow[]>;
 type LearningRow={switch_id:string;mac:string;port:string;hop?:number;frame_kind?:string};
@@ -257,7 +264,7 @@ export default function SimulatorPage(){
   const [mousePos,setMousePos]=useState({x:0,y:0});
   const [ctxMenu,setCtxMenu]=useState<{x:number;y:number;devId:string}|null>(null);
   const [tooltip,setTooltip]=useState<{x:number;y:number;dev:DeviceNode}|null>(null);
-  const [animPkts,setAnimPkts]=useState<{id:string;x:number;y:number;layer:string}[]>([]);
+  const [animPkts,setAnimPkts]=useState<{id:string;x:number;y:number;layer:string;color?:string}[]>([]);
   const [activeLnkModes,setActiveLnkModes]=useState<Record<string,"flood"|"unicast"|null>>({});
   const [flashDev,setFlashDev]=useState<string|null>(null);
   const [log,setLog]=useState<{t:string;msg:string;layer:string}[]>([]);
@@ -269,12 +276,14 @@ export default function SimulatorPage(){
 
   const [pipeline,setPipeline]=useState<PipelineSnapshot|null>(null);
   const [showPipeline,setShowPipeline]=useState(true);
-  const [domainStats,setDomainStats]=useState<DomainStats|null>(null);
+  const domainStats=useTopologyDomainStats(BACKEND,restOk===true,devices,links);
   const [topologyMode,setTopologyMode]=useState(false);
   const [switchTables,setSwitchTables]=useState<SwitchTables>({});
   const [switchPorts,setSwitchPorts]=useState<SwitchPorts>({});
   const [learningSummary,setLearningSummary]=useState<LearningRow[]>([]);
   const [resetLearning,setResetLearning]=useState(false);
+  const [extraFlows,setExtraFlows]=useState<ExtraFlow[]>([]);
+  const [primaryStartSlot,setPrimaryStartSlot]=useState("0");
   const [editTarget,setEditTarget]=useState<DeviceNode|null>(null);
   const [editLabel,setEditLabel]=useState("");
   const [editIp,setEditIp]=useState("");
@@ -365,11 +374,12 @@ export default function SimulatorPage(){
     idSeq=0; lnkSeq=0;
     setConnectFrom(null); setCtxMenu(null); setLinkCtx(null); setPlacePickType(null);
     setTopologyHint("");
-    setDomainStats(null);
     setTopologyMode(false);
     setSwitchTables({});
     setSwitchPorts({});
     setLearningSummary([]);
+    setExtraFlows([]);
+    setPrimaryStartSlot("0");
 
     if(kind==="demo"){
       const d1=mkDev("host",130,195), d2=mkDev("switch",330,195);
@@ -507,6 +517,7 @@ export default function SimulatorPage(){
     setLinks(p=>p.filter(l=>l.src!==id&&l.dst!==id));
     if(srcId===id)setSrcId(null);
     if(dstId===id)setDstId(null);
+    setExtraFlows(p=>p.filter(f=>f.src!==id&&f.dst!==id));
   }
 
   function getDevL(id:string,devs=devices):DeviceNode|undefined{return devs.find(d=>d.id===id);}
@@ -526,6 +537,8 @@ export default function SimulatorPage(){
     if(srcId===dstId) return "Source and destination must be different devices.";
     if(!isEndpointNodeId(srcId)||!isEndpointNodeId(dstId)) return "SRC and DST must be end devices (computer/server/laptop/router), not switch/hub.";
     if(!getPath(srcId,dstId)) return "No route: connect SRC and DST with one or more links.";
+    const ex=extraTrafficValidationError();
+    if(ex) return ex;
     return undefined;
   }
 
@@ -541,7 +554,61 @@ export default function SimulatorPage(){
     }return null;
   }
 
-  function canSim(){return !!(srcId&&dstId&&srcId!==dstId&&!running&&isEndpointNodeId(srcId)&&isEndpointNodeId(dstId)&&getPath(srcId,dstId));}
+  function parseStartSlot(s:string):number{
+    const n=parseInt(String(s).trim(),10);
+    if(Number.isNaN(n)) return 0;
+    return Math.max(0,Math.min(1000,n));
+  }
+
+  function buildTrafficFlowsPayload():TrafficFlowPayload[]{
+    const base=msg||"Hello!";
+    const primary:TrafficFlowPayload={
+      src_device_id:srcId!,
+      dst_device_id:dstId!,
+      message:base,
+      start_slot:parseStartSlot(primaryStartSlot),
+    };
+    const extras=extraFlows
+      .filter(f=>f.src&&f.dst&&f.src!==f.dst)
+      .map(f=>({
+        src_device_id:f.src,
+        dst_device_id:f.dst,
+        message:(f.msg.trim()||base),
+        start_slot:parseStartSlot(f.startSlot),
+      }));
+    return [primary,...extras];
+  }
+
+  function flowPrefixFromEv(ev:SimEvent):string{
+    const h=ev.pdu?.headers||{};
+    const m=ev.meta||{};
+    const fs=String(m.flow_src_device_id??h.flow_src_device_id??"");
+    const fd=String(m.flow_dst_device_id??h.flow_dst_device_id??"");
+    if(fs&&fd) return `[${devLabel(fs)}→${devLabel(fd)}] `;
+    const raw=m.flow_index??h.flow_index;
+    if(raw===undefined||raw===null) return "";
+    return `[F${Number(raw)+1}] `;
+  }
+
+  function extraTrafficValidationError():string|undefined{
+    if(!srcId||!dstId) return undefined;
+    for(const f of extraFlows){
+      const partial=!!(f.src||f.dst||f.msg.trim())&&(!f.src||!f.dst);
+      if(partial) return "Each extra flow needs both SRC and DST (or clear the row).";
+    }
+    const flows=buildTrafficFlowsPayload();
+    if(flows.length>6) return "At most 6 flows (1 primary + 5 extras).";
+    for(const f of flows){
+      if(!isEndpointNodeId(f.src_device_id)||!isEndpointNodeId(f.dst_device_id))
+        return "Each flow SRC/DST must be end devices.";
+      if(f.src_device_id===f.dst_device_id) return "A flow cannot have the same source and destination.";
+      if(!getPath(f.src_device_id,f.dst_device_id)) return `No route for ${devLabel(f.src_device_id)} → ${devLabel(f.dst_device_id)}.`;
+      if(f.start_slot<0||f.start_slot>1000) return "Start slot must be between 0 and 1000.";
+    }
+    return undefined;
+  }
+
+  function canSim(){return !simulateDisabledReason();}
 
   /** PHY medium for API: first segment on SRC→DST path (single-hop model). */
   function firstHopMedium(lnkList=links):MediumType{
@@ -606,8 +673,12 @@ export default function SimulatorPage(){
     setPipeline(null);
     setRunning(true); setSimRunning(true); clearEvents();
     const src=getDevL(srcId!)!, dst=getDevL(dstId!)!;
+    const trafficFlows=buildTrafficFlowsPayload();
     addLog("━━ Simulation start ━━","engine");
-    addLog(`${src.label} → ${dst.label} | mode=${simMode} | ${encoding} | PHY ${phyMedium} (1st hop)`,"engine");
+    const flowLines=trafficFlows.map(
+      f=>`${devLabel(f.src_device_id)} → ${devLabel(f.dst_device_id)} (start slot ${f.start_slot})`,
+    );
+    addLog(`${trafficFlows.length} flow(s): ${flowLines.join(" · ")} | mode=${simMode} | ${encoding} | PHY ${phyMedium} (1st hop)`,"engine");
 
     try{
       const berF=parseFloat(ber);
@@ -615,6 +686,7 @@ export default function SimulatorPage(){
       const body=simMode==="datalink"?{
         session_id:sessionId, src_device_id:srcId!, dst_device_id:dstId!,
         message:msg||"Hello!", framing,
+        traffic_flows:trafficFlows,
         framing_kwargs:framing==="fixed"?{frame_size:fixedFrameSize}:{},
         error_control:errCtrl, mac_protocol:macProto, flow_control:flowCtrl,
         window_size:winSz, encoding, medium:phyMedium,
@@ -638,14 +710,6 @@ export default function SimulatorPage(){
         const data=await resp.json();
         backendEvents=Array.isArray(data.events)?(data.events as SimEvent[]):[];
         setTopologyMode(!!data.topology_mode);
-        if(data.domain_stats){
-          setDomainStats({
-            broadcast_domains:Number(data.domain_stats.broadcast_domains??0),
-            collision_domains:Number(data.domain_stats.collision_domains??0),
-          });
-        } else {
-          setDomainStats(null);
-        }
         setSwitchTables((data.switch_tables??{}) as SwitchTables);
         latestSwitchPorts=(data.switch_ports??{}) as SwitchPorts;
         setSwitchPorts(latestSwitchPorts);
@@ -666,8 +730,9 @@ export default function SimulatorPage(){
         for(const ev of backendEvents){
           const l=EVT_LAYER[ev.event_type]||ev.layer||"engine";
           const h=ev.pdu?.headers||{};
+          const fp=flowPrefixFromEv(ev);
           if(h.steps&&Array.isArray(h.steps)){
-            for(const s of(h.steps as string[]).slice(0,4)) addLog(`  ${s}`,l);
+            for(const s of(h.steps as string[]).slice(0,4)) addLog(`${fp}  ${s}`,l);
           } else {
             let detail:string=ev.event_type;
             if(h.forwarding_mode==="flood"){
@@ -693,7 +758,7 @@ export default function SimulatorPage(){
             } else if(h.scheme) detail+=` [${h.scheme}]`;
             else if(h.protocol) detail+=` [${h.protocol}]`;
             else if(h.detail) detail+=`: ${h.detail}`;
-            addLog(`[${l.toUpperCase().slice(0,3)}] ${detail}`,l);
+            addLog(`${fp}[${l.toUpperCase().slice(0,3)}] ${detail}`,l);
           }
           await delay(25);
         }
@@ -703,7 +768,6 @@ export default function SimulatorPage(){
       }
     }catch(_){
       setRestOk(false);
-      setDomainStats(null);
       setTopologyMode(false);
       setSwitchTables({});
       setSwitchPorts({});
@@ -717,9 +781,24 @@ export default function SimulatorPage(){
     addLog(`[PHY] Signal drawn: ${encoding}`,"physical");
 
     if(simMode==="datalink"&&backendEvents.length){
-      // Replay true backend forwarding edges so first-send flood is visible on canvas.
+      const framingByFlow: Record<number, number> = {};
+      for(const ev of backendEvents){
+        if(ev.event_type!=="FRAMING_INFO") continue;
+        const h=ev.pdu?.headers||{};
+        const fi=Number(ev.meta?.flow_index ?? h.flow_index ?? 0);
+        const fb=Number(h.framed_bytes ?? h.raw_bytes ?? 64);
+        framingByFlow[fi]=Number.isFinite(fb)?fb:64;
+      }
       const modeByDecisionKey: Record<string,"flood"|"unicast"|null> = {};
-      const steps: {ts:number;from:string;to:string;linkId:string;mode:"flood"|"unicast"|null}[] = [];
+      const steps: {
+        ts:number;
+        from:string;
+        to:string;
+        linkId:string;
+        mode:"flood"|"unicast"|null;
+        flowIndex:number;
+        framedBytes:number;
+      }[] = [];
       for(const ev of backendEvents){
         const h=ev.pdu?.headers||{};
         const srcNode=String(ev.src_device??"");
@@ -735,12 +814,15 @@ export default function SimulatorPage(){
         if(!hs||!hd) continue;
         const lnk=links.find(l=>(l.src===hs&&l.dst===hd)||(l.src===hd&&l.dst===hs));
         if(!lnk) continue;
+        const fi=Number(h.flow_index ?? 0);
         steps.push({
           ts:Number(ev.timestamp??0),
           from:hs,
           to:hd,
           linkId:lnk.id,
           mode:modeByDecisionKey[k]??null,
+          flowIndex:fi,
+          framedBytes:framingByFlow[fi] ?? 64,
         });
       }
 
@@ -757,7 +839,10 @@ export default function SimulatorPage(){
           for(const s of batch) next[s.linkId]=s.mode;
           return next;
         });
-        await Promise.all(batch.map(s=>animPkt2(s.from,s.to,simMode)));
+        await Promise.all(batch.map(s=>animPkt2(s.from,s.to,simMode,{
+          framedBytes:s.framedBytes,
+          flowIndex:s.flowIndex,
+        })));
         setActiveLnkModes(prev=>{
           const next={...prev};
           for(const s of batch) delete next[s.linkId];
@@ -791,27 +876,51 @@ export default function SimulatorPage(){
       }
     }
 
-    addLog(`✓ Delivered to ${dst.label}`,"engine");
+    if(trafficFlows.length>1){
+      addLog(`✓ Completed ${trafficFlows.length} flows (primary destination: ${dst.label})`,"engine");
+    } else {
+      addLog(`✓ Delivered to ${dst.label}`,"engine");
+    }
     addLog("━━ Complete ━━","engine");
     setFlashDev(dstId!); setTimeout(()=>setFlashDev(null),900);
     setRunning(false); setSimRunning(false);
   }
 
-  async function animPkt2(fromId:string,toId:string,mode:string){
+  async function animPkt2(
+    fromId:string,
+    toId:string,
+    mode:string,
+    opts?:{framedBytes?:number;flowIndex?:number},
+  ){
     const from=getDevL(fromId)!, to=getDevL(toId)!;
     const layer=mode==="datalink"?"datalink":"physical";
-    const id=`pkt-${fromId}-${toId}-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
-    for(let i=0;i<=44;i++){
-      const f=i/44;
-      const x=from.x+(to.x-from.x)*f;
-      const y=from.y+(to.y-from.y)*f;
-      setAnimPkts(prev=>{
-        const others=prev.filter(p=>p.id!==id);
-        return [...others,{id,x,y,layer}];
+    const fb=opts?.framedBytes ?? 64;
+    const fi=opts?.flowIndex ?? 0;
+    const color=FLOW_ANIM_COLORS[fi%FLOW_ANIM_COLORS.length];
+    const beadCount=Math.max(3,Math.min(12,Math.floor(fb/36)+3));
+    const totalSteps=Math.min(90,Math.max(30,Math.round(44*(0.45+fb/500))));
+    const frameDelay=Math.max(7,Math.min(14,Math.round(12-fb/450)));
+    const idBase=`pkt-${fromId}-${toId}-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+    for(let step=0;step<=totalSteps;step++){
+      const t=step/totalSteps;
+      const beads=Array.from({length:beadCount},(_,b)=>{
+        const lag=(b/(beadCount+2))*0.42;
+        const f=Math.max(0,Math.min(1,t-lag));
+        return {
+          id:`${idBase}-b${b}`,
+          x:from.x+(to.x-from.x)*f,
+          y:from.y+(to.y-from.y)*f,
+          layer,
+          color,
+        };
       });
-      await delay(11);
+      setAnimPkts(prev=>{
+        const drop=prev.filter(p=>!p.id.startsWith(idBase));
+        return [...drop,...beads];
+      });
+      await delay(frameDelay);
     }
-    setAnimPkts(prev=>prev.filter(p=>p.id!==id));
+    setAnimPkts(prev=>prev.filter(p=>!p.id.startsWith(idBase)));
   }
 
   function drawWave(bits:number[],enc:string){
@@ -1192,6 +1301,81 @@ export default function SimulatorPage(){
               </div>
             </div>
           </div>
+          <div style={{flexBasis:"100%",borderTop:`1px solid ${UI.border}`,paddingTop:10,marginTop:4}}>
+            <div style={{fontSize:10,color:"#60a5fa",letterSpacing:1,marginBottom:6}}>
+              Multi-flow (hub first-hop contention)
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:8}}>
+              <button
+                type="button"
+                onClick={()=>setExtraFlows(p=>p.length>=MAX_EXTRA_FLOWS?p:[...p,{src:"",dst:"",msg:"",startSlot:"0"}])}
+                disabled={extraFlows.length>=MAX_EXTRA_FLOWS}
+                style={{
+                  ...pill,
+                  opacity:extraFlows.length>=MAX_EXTRA_FLOWS?0.5:1,
+                  borderColor:"#60a5fa",
+                  color:"#60a5fa",
+                }}
+              >
+                + Competing flow
+              </button>
+              <span style={{fontSize:9,color:UI.textSoft}}>
+                Up to {MAX_EXTRA_FLOWS} extras (6 flows total). Start slot 0 = all contend together; higher slots delay that flow (stagger to avoid collisions).
+              </span>
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:9,color:UI.textMuted}}>Primary start slot</span>
+              <input
+                type="number"
+                min={0}
+                max={1000}
+                value={primaryStartSlot}
+                onChange={e=>setPrimaryStartSlot(e.target.value)}
+                style={{...selSt,width:72,fontSize:11}}
+                title="Abstract slot when flow 1 may first contend on a shared hub"
+              />
+            </div>
+            {extraFlows.map((row,i)=>(
+              <div key={i} style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:6,alignItems:"center"}}>
+                <span style={{fontSize:9,color:UI.textMuted,width:52}}>Flow {i+2}</span>
+                <select
+                  value={row.src}
+                  onChange={e=>setExtraFlows(p=>p.map((x,j)=>j===i?{...x,src:e.target.value}:x))}
+                  style={{...selSt,width:120}}
+                >
+                  <option value="">SRC…</option>
+                  {devices.filter(d=>isEndpointDeviceType(d.type)).map(d=><option key={d.id} value={d.id}>{d.label}</option>)}
+                </select>
+                <span style={{fontSize:10,color:UI.textMuted}}>→</span>
+                <select
+                  value={row.dst}
+                  onChange={e=>setExtraFlows(p=>p.map((x,j)=>j===i?{...x,dst:e.target.value}:x))}
+                  style={{...selSt,width:120}}
+                >
+                  <option value="">DST…</option>
+                  {devices.filter(d=>isEndpointDeviceType(d.type)).map(d=><option key={d.id} value={d.id}>{d.label}</option>)}
+                </select>
+                <input
+                  value={row.msg}
+                  onChange={e=>setExtraFlows(p=>p.map((x,j)=>j===i?{...x,msg:e.target.value}:x))}
+                  placeholder="msg (optional)"
+                  style={{...selSt,width:100,fontSize:10}}
+                />
+                <span style={{fontSize:9,color:UI.textMuted}}>slot</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  value={row.startSlot}
+                  onChange={e=>setExtraFlows(p=>p.map((x,j)=>j===i?{...x,startSlot:e.target.value}:x))}
+                  style={{...selSt,width:56,fontSize:10}}
+                  title="First slot this flow may contend on shared hub"
+                />
+                <button type="button" onClick={()=>setExtraFlows(p=>p.filter((_,j)=>j!==i))} style={{...pill,padding:"2px 8px"}} title="Remove">✕</button>
+              </div>
+            ))}
+          </div>
+
           <div style={{
             minWidth:260,
             maxWidth:380,
@@ -1323,7 +1507,7 @@ export default function SimulatorPage(){
               })()}
 
               {animPkts.map(pkt=>{
-                const clr=LAYER_CLR[pkt.layer]||"#34d399";
+                const clr=pkt.color ?? (LAYER_CLR[pkt.layer] ?? "#34d399");
                 return(
                   <g key={pkt.id} transform={`translate(${pkt.x},${pkt.y})`}>
                     <circle r={11} fill={clr} opacity={0.92}

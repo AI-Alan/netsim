@@ -51,40 +51,43 @@ class DataLinkLayer(Layer):
         payload   = self._to_bytes(pdu)
         dst_mac   = pdu.meta.get("dst_mac", "ff:ff:ff:ff:ff:ff")
         ts        = pdu.meta.get("timestamp", 0.0)
+        quiet_hop = bool(pdu.meta.get("topology_quiet_hop"))
 
         # 1. Framing info event
         framed_raw = self._framing.frame(payload)
-        self.emit(SimEvent(
-            timestamp=ts, event_type=EventType.FRAMING_INFO,
-            layer=LayerName.DATALINK, src_device=self.device_id,
-            pdu=PDU(type="framing", headers={
-                "scheme":       self._framing.name,
-                "raw_bytes":    len(payload),
-                "framed_bytes": len(framed_raw),
-                "payload_hex_preview": _hex_preview(payload),
-                "framed_hex_preview": _hex_preview(framed_raw),
-            }),
-            meta={"detail": f"Framing: {self._framing.name}"},
-        ))
+        if not quiet_hop:
+            self.emit(SimEvent(
+                timestamp=ts, event_type=EventType.FRAMING_INFO,
+                layer=LayerName.DATALINK, src_device=self.device_id,
+                pdu=PDU(type="framing", headers={
+                    "scheme":       self._framing.name,
+                    "raw_bytes":    len(payload),
+                    "framed_bytes": len(framed_raw),
+                    "payload_hex_preview": _hex_preview(payload),
+                    "framed_hex_preview": _hex_preview(framed_raw),
+                }),
+                meta={"detail": f"Framing: {self._framing.name}"},
+            ))
 
         # 2. MAC access control
         mac_result = self._mac.transmit(
             channel_busy=pdu.meta.get("channel_busy", False),
             collision_prob=pdu.meta.get("collision_prob", 0.02),
         )
-        self.emit(SimEvent(
-            timestamp=ts, event_type=EventType.ACCESS_CONTROL,
-            layer=LayerName.DATALINK, src_device=self.device_id,
-            pdu=PDU(type="mac", headers={
-                "protocol":      self._mac.name,
-                "transmitted":   mac_result.transmitted,
-                "attempts":      mac_result.attempts,
-                "collision":     mac_result.collision,
-                "rts_cts_used":  mac_result.rts_cts_used,
-                "steps":         mac_result.steps,
-            }),
-            meta={"detail": mac_result.detail},
-        ))
+        if not quiet_hop:
+            self.emit(SimEvent(
+                timestamp=ts, event_type=EventType.ACCESS_CONTROL,
+                layer=LayerName.DATALINK, src_device=self.device_id,
+                pdu=PDU(type="mac", headers={
+                    "protocol":      self._mac.name,
+                    "transmitted":   mac_result.transmitted,
+                    "attempts":      mac_result.attempts,
+                    "collision":     mac_result.collision,
+                    "rts_cts_used":  mac_result.rts_cts_used,
+                    "steps":         mac_result.steps,
+                }),
+                meta={"detail": mac_result.detail},
+            ))
 
         if not mac_result.transmitted:
             self.emit(SimEvent(
@@ -138,21 +141,22 @@ class DataLinkLayer(Layer):
         # 5. Flow control: ARQ simulation (1 logical frame here)
         flow_result = self._flow.transfer(total_frames=1,
                                           error_rate=pdu.meta.get("link_error_rate", 0.0))
-        self.emit(SimEvent(
-            timestamp=ts, event_type=EventType.FLOW_CONTROL,
-            layer=LayerName.DATALINK, src_device=self.device_id,
-            pdu=PDU(type="arq", headers={
-                "protocol":       self._flow.name,
-                "window_size":    self._flow.window_size,
-                "frames_sent":    flow_result.frames_sent,
-                "retransmissions":flow_result.retransmissions,
-                "efficiency":     round(flow_result.efficiency, 4),
-                "steps":          flow_result.steps,
-            }),
-            meta={"detail": flow_result.detail},
-        ))
+        if not quiet_hop:
+            self.emit(SimEvent(
+                timestamp=ts, event_type=EventType.FLOW_CONTROL,
+                layer=LayerName.DATALINK, src_device=self.device_id,
+                pdu=PDU(type="arq", headers={
+                    "protocol":       self._flow.name,
+                    "window_size":    self._flow.window_size,
+                    "frames_sent":    flow_result.frames_sent,
+                    "retransmissions":flow_result.retransmissions,
+                    "efficiency":     round(flow_result.efficiency, 4),
+                    "steps":          flow_result.steps,
+                }),
+                meta={"detail": flow_result.detail},
+            ))
 
-        # 6. FRAME_SENT
+        # 6. FRAME_SENT (always emit — used for pipeline / tracing; quiet_hop only trims verbose steps above)
         wire_bytes = frame.to_bytes()
         self.emit(SimEvent(
             timestamp=ts, event_type=EventType.FRAME_SENT,

@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from layers.base import LayerPDU
 from layers.physical.factory import PhysicalLayerFactory
@@ -17,6 +17,7 @@ from layers.physical.models import Bits
 from layers.datalink.factory import DataLinkLayerFactory
 from simulation.events import SimEvent, EventType, LayerName, PDU, sim_event_to_dict, sim_event_to_json
 from simulation.topology_runtime import simulate_datalink_topology
+from routes.topology_domain import router as topology_domain_router
 from websocket.emitter import ConnectionManager
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,8 @@ app = FastAPI(title="NetSim", version="2.0.0",
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+app.include_router(topology_domain_router)
 
 sessions: Dict[str, Dict[str, Any]] = {}
 ws_manager = ConnectionManager()
@@ -43,6 +46,13 @@ class PhysicalSimReq(BaseModel):
     clock_rate:      int = 1000
     samples_per_bit: int = 100
     medium_kwargs:   Dict[str, Any] = {}
+
+class TrafficFlow(BaseModel):
+    src_device_id: str
+    dst_device_id: str
+    message: str = ""
+    start_slot: int = Field(default=0, ge=0, le=1000)
+
 
 class DataLinkSimReq(BaseModel):
     session_id:     str
@@ -67,6 +77,7 @@ class DataLinkSimReq(BaseModel):
     topology_devices: List[Dict[str, Any]] = []
     topology_links: List[Dict[str, Any]] = []
     reset_learning: bool = False
+    traffic_flows: List[TrafficFlow] = Field(default_factory=list)
 
 class DeviceConfigReq(BaseModel):
     device_id:   str; device_type: str = "end_host"

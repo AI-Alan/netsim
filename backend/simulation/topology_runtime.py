@@ -12,11 +12,16 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from hashlib import sha1
 import json
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 from layers.base import LayerPDU
 from layers.datalink.factory import DataLinkLayerFactory
 from simulation.events import EventType, LayerName, PDU, SimEvent
+from simulation.medium_contention import FlowSeed, contend_hub_first_hop
+
+
+ENDPOINT_TYPES = frozenset({"host", "computer", "server", "laptop", "end_host", "router"})
 
 
 def topology_fingerprint(devices: List[Dict[str, Any]], links: List[Dict[str, Any]]) -> str:
@@ -103,6 +108,9 @@ class HostRole(ForwardingPlane):
         blocked = None
         if ingress_port:
             blocked = next((p.neighbor_id for p in node.ports if p.port_id == ingress_port), None)
+        # Broadcast (e.g. learning ACK): must be allowed to egress via the same shared segment we came from.
+        if dst_mac == "ff:ff:ff:ff:ff:ff":
+            blocked = None
         next_hop = self._route_next_hop(node.device_id, dst_device, graph, blocked_neighbor=blocked)
         if not next_hop:
             return [], {"mode": "drop", "detail": "No forward path from this node."}
@@ -164,14 +172,37 @@ ROLE_MAP: dict[str, ForwardingPlane] = {
 }
 
 
-def _emit_engine(collected: List[SimEvent], ts: float, src: str, detail: str, dst: Optional[str] = None, **headers: Any) -> None:
+def _emit_engine(
+    collected: List[SimEvent],
+    ts: float,
+    src: str,
+    detail: str,
+    dst: Optional[str] = None,
+    *,
+    flow_index: Optional[int] = None,
+    flow_src_device_id: Optional[str] = None,
+    flow_dst_device_id: Optional[str] = None,
+    **headers: Any,
+) -> None:
+    h = {"detail": detail, **headers}
+    meta: dict[str, Any] = {}
+    if flow_index is not None:
+        h["flow_index"] = flow_index
+        meta["flow_index"] = flow_index
+    if flow_src_device_id is not None:
+        h["flow_src_device_id"] = flow_src_device_id
+        meta["flow_src_device_id"] = flow_src_device_id
+    if flow_dst_device_id is not None:
+        h["flow_dst_device_id"] = flow_dst_device_id
+        meta["flow_dst_device_id"] = flow_dst_device_id
     collected.append(SimEvent(
         timestamp=ts,
         event_type=EventType.SESSION_INFO,
         layer=LayerName.ENGINE,
         src_device=src,
         dst_device=dst,
-        pdu=PDU(type="topology", headers={"detail": detail, **headers}),
+        pdu=PDU(type="topology", headers=h),
+        meta=meta,
     ))
 
 
@@ -247,6 +278,92 @@ def domain_stats(graph: dict[str, DeviceNode]) -> dict[str, int]:
     return {"broadcast_domains": bd, "collision_domains": cd}
 
 
+def collision_domain_id(src: str, dst: str, graph: dict[str, DeviceNode]) -> str:
+    nxt = HostRole._route_next_hop(src, dst, graph, None)
+    if not nxt:
+        return f"orphan:{src}"
+    if graph[nxt].device_type == "hub":
+        return f"hub:{nxt}"
+    a, b = sorted([src, nxt])
+    return f"link:{a}:{b}"
+
+
+def _path_exists(a: str, b: str, graph: dict[str, DeviceNode]) -> bool:
+    q: deque[str] = deque([a])
+    vis = {a}
+    while q:
+        c = q.popleft()
+        if c == b:
+            return True
+        for p in graph[c].ports:
+            if p.neighbor_id not in vis:
+                vis.add(p.neighbor_id)
+                q.append(p.neighbor_id)
+    return False
+
+
+def _normalize_traffic_flows(req: Any) -> List[Tuple[int, str, str, bytes, int]]:
+    tf = getattr(req, "traffic_flows", None) or []
+    if not tf:
+        return [
+            (
+                0,
+                req.src_device_id,
+                req.dst_device_id,
+                (req.message or "Hello NetSim").encode(),
+                0,
+            ),
+        ]
+    out: List[Tuple[int, str, str, bytes, int]] = []
+    base_msg = getattr(req, "message", None) or "Hello NetSim"
+    for i, f in enumerate(tf):
+        if hasattr(f, "src_device_id"):
+            s, d, m = f.src_device_id, f.dst_device_id, getattr(f, "message", "") or ""
+            ss = int(getattr(f, "start_slot", 0) or 0)
+        else:
+            s = str(f.get("src_device_id", ""))
+            d = str(f.get("dst_device_id", ""))
+            m = str(f.get("message") or "")
+            ss = int(f.get("start_slot", 0) or 0)
+        msg = (m or base_msg).encode()
+        ss = max(0, min(1000, ss))
+        out.append((i, s, d, msg, ss))
+    return out
+
+
+def _is_endpoint(graph: dict[str, DeviceNode], nid: str) -> bool:
+    return graph[nid].device_type in ENDPOINT_TYPES
+
+
+def _tag_hop_events(
+    hop_events: List[SimEvent],
+    flow_index: int,
+    flow_src_device_id: str,
+    flow_dst_device_id: str,
+) -> List[SimEvent]:
+    out: List[SimEvent] = []
+    for e in hop_events:
+        d = e.model_dump()
+        pdu = d.get("pdu") or {}
+        d["pdu"] = {
+            **pdu,
+            "headers": {
+                **(pdu.get("headers") or {}),
+                "flow_index": flow_index,
+                "flow_src_device_id": flow_src_device_id,
+                "flow_dst_device_id": flow_dst_device_id,
+            },
+        }
+        d["meta"] = {
+            **d.get("meta", {}),
+            "flow_index": flow_index,
+            "flow_src_device_id": flow_src_device_id,
+            "flow_dst_device_id": flow_dst_device_id,
+        }
+        out.append(SimEvent.model_validate(d))
+    return out
+
+
 def simulate_datalink_topology(
     *,
     req: Any,
@@ -278,36 +395,165 @@ def simulate_datalink_topology(
         if n.device_type == "switch":
             switch_tables.setdefault(n.device_id, {})
 
-    src = req.src_device_id
-    dst = req.dst_device_id
-    if src not in graph or dst not in graph:
-        return [], domain_stats(graph), {}, [], {}
+    flows_raw = _normalize_traffic_flows(req)
+    flow_by_idx: dict[int, tuple[str, str]] = {}
+    for fi, s, d, _, _ss in flows_raw:
+        if s not in graph or d not in graph:
+            return [], domain_stats(graph), {}, [], {}
+        if s == d or not _is_endpoint(graph, s) or not _is_endpoint(graph, d):
+            return [], domain_stats(graph), {}, [], {}
+        if not _path_exists(s, d, graph):
+            return [], domain_stats(graph), {}, [], {}
+        flow_by_idx[fi] = (s, d)
 
     collected: List[SimEvent] = []
     learning_summary: list[dict[str, Any]] = []
-    src_mac = graph[src].mac
-    dst_mac = graph[dst].mac
-    payload = (req.message or "Hello NetSim").encode()
     flow_kwargs = {"window": req.window_size} if req.flow_control in ("go_back_n", "selective_repeat") else {}
 
-    pending: deque[tuple[str, Optional[str], int, str, str, bytes, str, str]] = deque([
-        # node_id, ingress_port, hop, frame_src_mac, frame_dst_mac, payload, frame_kind, final_dst
-        (src, None, 0, src_mac, dst_mac, payload, "data", dst),
-    ])
-    # Loop guard tracks edge traversals by frame context to avoid suppressing
-    # valid forwarding across multi-switch topologies.
-    traversed: set[tuple[str, str, str, int, str, str, str]] = set()
-    delivered = False
+    rng = random.Random(hash((req.session_id, tuple(flows_raw))) % (2**32))
+
+    def emit_access(
+        device_id: str,
+        flow_dst_id: str,
+        flow_index: int,
+        protocol: str,
+        transmitted: bool,
+        attempts: int,
+        steps: list[str],
+        detail: str,
+    ) -> None:
+        fs, fd = flow_by_idx[flow_index]
+        collected.append(
+            SimEvent(
+                timestamp=0.0,
+                event_type=EventType.ACCESS_CONTROL,
+                layer=LayerName.DATALINK,
+                src_device=device_id,
+                dst_device=flow_dst_id,
+                pdu=PDU(
+                    type="mac",
+                    headers={
+                        "protocol": protocol,
+                        "transmitted": transmitted,
+                        "attempts": attempts,
+                        "collision": not transmitted,
+                        "steps": steps,
+                        "flow_index": flow_index,
+                        "flow_src_device_id": fs,
+                        "flow_dst_device_id": fd,
+                    },
+                ),
+                meta={
+                    "detail": detail,
+                    "flow_index": flow_index,
+                    "flow_src_device_id": fs,
+                    "flow_dst_device_id": fd,
+                },
+            )
+        )
+
+    # Group by collision domain; hub CD runs multi-station first-hop contention.
+    pending_seeds: deque[
+        tuple[str, Optional[str], int, str, str, bytes, str, str, str, int]
+    ] = deque()
+    by_cd: dict[str, List[FlowSeed]] = defaultdict(list)
+    for fi, s, d, pl, start_slot in flows_raw:
+        by_cd[collision_domain_id(s, d, graph)].append(
+            FlowSeed(flow_index=fi, src=s, dst=d, payload=pl, start_slot=start_slot),
+        )
+
+    for _cd, seeds in sorted(by_cd.items(), key=lambda x: x[0]):
+        if len(seeds) == 1:
+            w = seeds[0]
+            pending_seeds.append(
+                (
+                    w.src,
+                    None,
+                    0,
+                    graph[w.src].mac,
+                    graph[w.dst].mac,
+                    w.payload,
+                    "data",
+                    w.dst,
+                    w.src,
+                    w.flow_index,
+                )
+            )
+        elif _cd.startswith("hub:"):
+            ordered = contend_hub_first_hop(
+                seeds,
+                mac_protocol=req.mac_protocol,
+                collision_prob=req.collision_prob,
+                rng=rng,
+                emit_access=emit_access,
+            )
+            for w in ordered:
+                pending_seeds.append(
+                    (
+                        w.src,
+                        None,
+                        0,
+                        graph[w.src].mac,
+                        graph[w.dst].mac,
+                        w.payload,
+                        "data",
+                        w.dst,
+                        w.src,
+                        w.flow_index,
+                    )
+                )
+        else:
+            for w in sorted(seeds, key=lambda x: x.flow_index):
+                pending_seeds.append(
+                    (
+                        w.src,
+                        None,
+                        0,
+                        graph[w.src].mac,
+                        graph[w.dst].mac,
+                        w.payload,
+                        "data",
+                        w.dst,
+                        w.src,
+                        w.flow_index,
+                    )
+                )
+
+    pending: deque[tuple[str, Optional[str], int, str, str, bytes, str, str, str, int]] = pending_seeds
+    traversed: set[tuple[str, str, str, int, str, str, str, int]] = set()
+    delivered_flows: set[int] = set()
 
     while pending:
-        node_id, ingress_port, hop, frame_src_mac, frame_dst_mac, frame_payload, frame_kind, frame_final_dst = pending.popleft()
+        (
+            node_id,
+            ingress_port,
+            hop,
+            frame_src_mac,
+            frame_dst_mac,
+            frame_payload,
+            frame_kind,
+            frame_final_dst,
+            conversation_src,
+            flow_index,
+        ) = pending.popleft()
         node = graph[node_id]
         if hop > max(2 * len(graph), 8):
-            _emit_engine(collected, float(hop), node_id, "Frame dropped due to forwarding loop protection.", dst=dst)
+            fs, fd = flow_by_idx[flow_index]
+            _emit_engine(
+                collected,
+                float(hop),
+                node_id,
+                "Frame dropped due to forwarding loop protection.",
+                dst=frame_final_dst,
+                flow_index=flow_index,
+                flow_src_device_id=fs,
+                flow_dst_device_id=fd,
+            )
             continue
         if node_id == frame_final_dst:
             if frame_kind == "data":
-                delivered = True
+                delivered_flows.add(flow_index)
+            fs, fd = flow_by_idx[flow_index]
             _emit_engine(
                 collected,
                 float(hop),
@@ -315,29 +561,36 @@ def simulate_datalink_topology(
                 f"{frame_kind.upper()} destination received frame.",
                 dst=frame_final_dst,
                 via=ingress_port,
+                flow_index=flow_index,
+                flow_src_device_id=fs,
+                flow_dst_device_id=fd,
             )
             if frame_kind == "data":
-                # Destination emits a reply as a new transmission from host NIC.
-                # Do not carry ingress_port here; otherwise single-homed hosts may
-                # be unable to route the reply back to the switch for learning.
                 _emit_engine(
                     collected,
                     float(hop),
                     node_id,
                     "Destination sends broadcast ACK for learning.",
-                    dst=src,
+                    dst=conversation_src,
                     ack_broadcast=True,
+                    flow_index=flow_index,
+                    flow_src_device_id=fs,
+                    flow_dst_device_id=fd,
                 )
-                pending.append((
-                    node_id,
-                    None,
-                    hop + 1,
-                    graph[node_id].mac,                      # ACK source MAC (destination host)
-                    "ff:ff:ff:ff:ff:ff",                     # broadcast ACK
-                    b"ACK",
-                    "ack",
-                    src,                                     # eventually target original source
-                ))
+                pending.append(
+                    (
+                        node_id,
+                        None,
+                        hop + 1,
+                        graph[node_id].mac,
+                        "ff:ff:ff:ff:ff:ff",
+                        b"ACK",
+                        "ack",
+                        conversation_src,
+                        conversation_src,
+                        flow_index,
+                    )
+                )
             continue
 
         role = ROLE_MAP.get(node.device_type, HostRole())
@@ -348,6 +601,7 @@ def simulate_datalink_topology(
         if node.device_type == "switch":
             st.pop("__current_src_mac__", None)
 
+        fs, fd = flow_by_idx[flow_index]
         _emit_engine(
             collected,
             float(hop),
@@ -362,6 +616,9 @@ def simulate_datalink_topology(
             frame_kind=frame_kind,
             src_mac=frame_src_mac,
             dst_mac=frame_dst_mac,
+            flow_index=flow_index,
+            flow_src_device_id=fs,
+            flow_dst_device_id=fd,
         )
         if info.get("learned"):
             learning_summary.append({
@@ -380,6 +637,7 @@ def simulate_datalink_topology(
                 frame_src_mac,
                 frame_dst_mac,
                 frame_final_dst,
+                flow_index,
             )
             if edge in traversed:
                 continue
@@ -403,7 +661,7 @@ def simulate_datalink_topology(
                 mac_kwargs=req.mac_kwargs,
             )
             dll.attach_observer(CollectObs())
-            pdu = LayerPDU(data=payload, meta={
+            pdu = LayerPDU(data=frame_payload, meta={
                 "src_device": node_id,
                 "dst_device": frame_final_dst,
                 "dst_mac": frame_dst_mac if out.neighbor_id == frame_final_dst else "ff:ff:ff:ff:ff:ff",
@@ -412,10 +670,11 @@ def simulate_datalink_topology(
                 "collision_prob": req.collision_prob if out.medium == "wired" else max(req.collision_prob * 0.5, 0.0),
                 "link_error_rate": req.link_error_rate,
                 "inject_error": req.inject_error,
+                # Skip duplicate FRAMING/MAC/ARQ logs on every hop — first hop + hub contention carry the story.
+                "topology_quiet_hop": hop >= 1,
             })
-            pdu.data = frame_payload
             dll.send_down(pdu)
-            collected.extend(hop_events)
+            collected.extend(_tag_hop_events(hop_events, flow_index, fs, fd))
 
             _emit_engine(
                 collected,
@@ -427,29 +686,53 @@ def simulate_datalink_topology(
                 link=f"{node_id}->{out.neighbor_id}",
                 egress_port=out.port_id,
                 frame_kind=frame_kind,
+                flow_index=flow_index,
+                flow_src_device_id=fs,
+                flow_dst_device_id=fd,
             )
 
             ingress_on_next = next((p.port_id for p in graph[out.neighbor_id].ports if p.neighbor_id == node_id), None)
-            pending.append((
-                out.neighbor_id,
-                ingress_on_next,
-                hop + 1,
-                frame_src_mac,
-                frame_dst_mac,
-                frame_payload,
-                frame_kind,
-                frame_final_dst,
-            ))
+            pending.append(
+                (
+                    out.neighbor_id,
+                    ingress_on_next,
+                    hop + 1,
+                    frame_src_mac,
+                    frame_dst_mac,
+                    frame_payload,
+                    frame_kind,
+                    frame_final_dst,
+                    conversation_src,
+                    flow_index,
+                )
+            )
 
-    if not delivered:
-        collected.append(SimEvent(
-            timestamp=0.0,
-            event_type=EventType.FRAME_DROPPED,
-            layer=LayerName.DATALINK,
-            src_device=src,
-            dst_device=dst,
-            pdu=PDU(type="frame", headers={"reason": "Topology forwarding ended before destination delivery"}),
-        ))
+    for fi in flow_by_idx:
+        if fi not in delivered_flows:
+            s, d = flow_by_idx[fi]
+            collected.append(
+                SimEvent(
+                    timestamp=0.0,
+                    event_type=EventType.FRAME_DROPPED,
+                    layer=LayerName.DATALINK,
+                    src_device=s,
+                    dst_device=d,
+                    pdu=PDU(
+                        type="frame",
+                        headers={
+                            "reason": "Topology forwarding ended before destination delivery",
+                            "flow_index": fi,
+                            "flow_src_device_id": s,
+                            "flow_dst_device_id": d,
+                        },
+                    ),
+                    meta={
+                        "flow_index": fi,
+                        "flow_src_device_id": s,
+                        "flow_dst_device_id": d,
+                    },
+                )
+            )
 
     snapshot: dict[str, list[dict[str, Any]]] = {}
     for sw_id, table in switch_tables.items():
