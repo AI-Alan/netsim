@@ -1,223 +1,132 @@
 # ITL351 — NetSim: Specification Document
 
-**Course:** ITL351 — Computer Networks Lab  
-**Assignment:** Semester Project — Submission 1 (document dated February 25, 2026)  
-**Submission deadline:** March 25, 2026 (via Gradescope, per course notice)  
-**Project title:** Network simulator implementing the protocol stack (Physical + Data Link for this submission)
+**Course:** ITL351 — Computer Networks Lab
+**Assignment:** Semester Project — Submission 1
+**Submission deadline:** March 25, 2026 (via Gradescope)
+**Project title:** Network Simulator implementing the Protocol Stack
 
-**Implementation:** NetSim v2.0  
-**Repository layout:** `frontend/` (Next.js 14 + TypeScript) · `backend/` (Python FastAPI) · WebSockets for live events
+**Implementation:** NetSim v2.0
+**Repository:** https://github.com/AI-Alan/netsim
+**Stack:** Next.js 14 + TypeScript (frontend) · Python FastAPI (backend) · WebSockets (real-time events)
 
-**Group:** *(add names; max 4 students per course rules)*
+**Group Members:**
 
-This document is the **formal specification** required by the assignment: it describes design choices, I/O representation, formats, and what is implemented. It should be **updated with each submission**.
+| Name | Enrollment No. |
+|------|----------------|
+| Aman Kumar Yadav | 2023BITE045 |
+| Ashish Chaudhary | 2023BITE061 |
+| Akshat Singh | 2023BITE029 |
 
----
-
-## 1. Assignment alignment (Submission 1)
-
-The course project is **open-ended** (language, UI, formats). This section maps **ITL351 Submission 1** objectives to **this codebase**.
-
-### 1.1 Physical layer (course minimum deliverables)
-
-| Course requirement | How NetSim satisfies it |
-|--------------------|-------------------------|
-| Creating **end devices** and **hubs** | UI palette: place **host** (end device) and **hub**; labels, MAC/IP editable. |
-| **Connections** forming a **topology** | User draws links between devices; **wired** vs **wireless**; presets (e.g. star, demo). |
-| **Sending and receiving data** | **Simulate** runs PHY or DLL simulation; backend emits send/receive events (`BITS_SENT`, `FRAME_SENT`, `FRAME_RECEIVED`, topology `SESSION_INFO`, etc.). |
-
-### 1.2 Data link layer (course minimum deliverables)
-
-| Course requirement | How NetSim satisfies it |
-|--------------------|-------------------------|
-| Layer 2 devices: **bridge** and **switch** | **Switch** implemented with MAC learning and forwarding. A **bridge** is not a separate icon; *switch behavior in this project fulfills the L2 learning bridge/switch requirement* (transparent bridge semantics via the switch role). **Hub** is L1 repeat; included for PHY test cases. |
-| **Address learning** (switch) | Per-switch MAC→port table; learning on ingress; persists per backend **session** until topology fingerprint changes or **Reset tables**. |
-| At least one **error control** protocol | e.g. **CRC-32**, **checksum**, optional inject error — selectable in DLL config / API. |
-| At least one **access control** protocol | e.g. **CSMA/CD**, **CSMA/CA**, CSMA, ALOHA variants — selectable. |
-| At least one **sliding-window flow control** protocol | **Go-Back-N** and **Selective Repeat** (window size configurable); also Stop-and-Wait. |
-
-### 1.3 Course test cases (mapping)
-
-**PHY — two end devices, dedicated link, data transmission**  
-- Build two **hosts**, one **link**, set **SRC/DST**, run **Simulate** (PHY or DLL mode).  
-- *Simulation only* — no real network traffic; matches assignment note.
-
-**PHY — star: five end devices + hub, hub semantics**  
-- Load **Star** preset or place one **hub** and five **hosts**, link each host to the hub, assign SRC/DST among hosts, run simulation.  
-- **Hub** role **floods** to all ports except ingress (`HubRole` in `topology_runtime.py`).
-
-**DLL — one switch, five end devices, transmission, access + flow control, broadcast/collision domains**  
-- Place **one switch**, five **hosts**, all connected to the switch; run **datalink** topology mode with chosen **MAC** and **flow** options.  
-- Sidebar shows **broadcast/collision domain** counts from backend (`domain_stats`).  
-- **Switch MAC tables** panel shows learning; event log shows DLL/PHY events.
-
-**DLL — two stars (hub + five hosts each), hubs connected by a switch, ten hosts, domains**  
-- Build manually: two hubs, each with five hosts, one **switch** between the two hubs, links as required; run simulation and read **domain_stats** in the API response / UI.  
-- *Grader note:* exact topology is user-constructed on canvas; presets do not auto-build this 10-host layout.
 
 ---
 
-## 2. Possible add-ons (course list) — status
+## 1. Assignment Alignment (Submission 1)
 
-| Add-on (from PDF) | Status in NetSim |
-|-------------------|------------------|
-| PHY: bits, line coding, **signal** display | **Yes** — bit string / message → encoding; **Canvas** waveform; encodings e.g. NRZ, Manchester, AMI, 4B5B (`GET /api/encodings`). |
-| PHY: **topology** of network | **Yes** — graphical canvas with devices and links. |
-| DLL: **noise** / error models | **Partial** — BER dropdown, collision probability, inject error for CRC/checksum demos; not a full continuous noise channel model. |
-| More error / correction / MAC / flow techniques | **Partial** — multiple schemes via factories; not exhaustive. |
+NetSim implements all minimum deliverables for Submission 1 across both the Physical and Data Link layers.
 
----
+For the **Physical layer**, the simulator supports creating end devices (hosts) and hubs, connecting them into arbitrary topologies via wired or wireless links, and simulating data transmission between any two nodes. Hub flooding behavior is faithfully reproduced — frames are forwarded to all ports except the ingress.
 
-## 3. Purpose and product scope
-
-### 3.1 Goal
-
-Educational simulator: **Physical** and **Data Link** layers with **graphical topology**, **REST API**, optional **WebSocket** event stream, and **topology-aware** L2 forwarding (hosts, hubs, switches).
-
-### 3.2 In scope (implemented)
-
-- Physical: line encoding, signal samples/events, wired/wireless medium in API/UI.  
-- Data link: framing, error control, MAC, ARQ flow control; multi-node **topology runtime** with switch learning and domain statistics.  
-- Web UI: editor, waveform panel, event log, switch MAC table view, resizable panels.
-
-### 3.3 Out of scope / stubs
-
-- **Network, Transport, Application** — event types and UI placeholders; **not** full end-to-end stack in this submission.  
-- Not bit-accurate real-time Ethernet PHY timing (educational stepping).
+For the **Data Link layer**, the simulator supports Layer 2 switches with MAC address learning and forwarding, multiple error control schemes (CRC-32, checksum), access control protocols (CSMA/CD, CSMA/CA, ALOHA variants), and sliding-window flow control (Go-Back-N, Selective Repeat). Broadcast and collision domain counts are computed and displayed for any topology.
 
 ---
 
-## 4. System architecture
+## 2. System Architecture
 
-```mermaid
+```
 flowchart LR
   subgraph client [Browser]
-    UI[Next.js UI]
-    Store[Zustand store]
-    UI --> Store
+    UI[Next.js UI] --> Store[Zustand store]
   end
   subgraph server [Python Backend]
-    API[FastAPI REST]
-    WS[WebSocket hub]
-    PHY[Physical layer factory]
-    DLL[Data link layer factory]
-    Topo[Topology runtime]
-    API --> PHY
-    API --> DLL
-    API --> Topo
-    Topo --> PHY
-    Topo --> DLL
+    API[FastAPI REST] --> PHY[Physical layer]
+    API --> DLL[Data link layer]
+    API --> Topo[Topology runtime]
   end
   UI -->|HTTP JSON| API
-  UI -->|optional events| WS
+  UI -->|real-time events| WS[WebSocket]
 ```
 
-- **Frontend:** `/` landing, `/simulator` main UI; `NEXT_PUBLIC_BACKEND_URL`, `NEXT_PUBLIC_WS_URL` for API/WebSocket.  
-- **Backend:** `POST /api/simulate/physical`, `POST /api/simulate/datalink`; topology packaged in datalink request when `topology_devices` / `topology_links` are set (`simulate_datalink_topology`).
+The frontend communicates with the backend over HTTP for simulation requests and optionally over WebSocket for streaming events. The topology runtime handles multi-node forwarding logic (host routing, switch learning, hub flooding) when a full topology is submitted alongside a simulation request.
 
 ---
 
-## 5. Technology stack
+## 3. Technology Stack
 
 | Component | Technology |
 |-----------|------------|
 | Frontend | Next.js 14, React 18, TypeScript, Zustand |
 | Backend | Python 3, FastAPI, Pydantic v2, Uvicorn |
-| Real-time | WebSockets `/ws/{session_id}` |
-| Tests | Frontend: Vitest; Backend: `pytest` in `backend/tests/` |
+| Real-time | WebSockets |
+| Tests | Vitest (frontend), pytest (backend) |
 
 ---
 
-## 6. TCP/IP model (UI convention)
+## 4. Layer Model Convention
 
-Four-layer **TCP/IP** presentation: Application (incl. session/presentation), Transport, Network, Data Link, Physical — **Physical** and **Data Link** are **live** in this build.
-
----
-
-## 7. Functional specification (technical)
-
-### 7.1 Physical layer
-
-- Encodings from `PhysicalLayerFactory` — `GET /api/encodings`.  
-- Media — `GET /api/media` (`wired`, `wireless`).  
-- `POST /api/simulate/physical`: bit string, encoding, medium, clock/samples — events `BITS_SENT`, `SIGNAL_DRAWN`, etc.
-
-### 7.2 Data link layer
-
-- Options — `GET /api/datalink/options` (framing, error, `mac_proto`, flow).  
-- Framing: variable (HDLC-style) and fixed-size; error: CRC-32, checksum, none; MAC: ALOHA, CSMA, CSMA/CD, CSMA/CA; flow: stop-and-wait, GBN, selective repeat.
-
-### 7.3 Topology runtime (`backend/simulation/topology_runtime.py`)
-
-- Graph from devices + links.  
-- **Host:** route toward destination along graph.  
-- **Switch:** learn source MAC on port; unicast if known; flood unknown unicast and broadcast.  
-- **Hub:** flood except ingress.  
-- Session **switch_tables**; fingerprint reset; `reset_learning` flag.  
-- Returns `domain_stats`, `switch_tables`, `learning_summary`, `switch_ports`.
-
-### 7.4 Events
-
-- `SimEvent` model (`backend/simulation/events.py`); WebSocket broadcast when clients connected.
-
-### 7.5 Frontend (simulator)
-
-- Topology editing, presets, PHY/DLL modes, DLL config, waveform (Canvas), event log, MAC tables (scrollable), overlay stacking for tooltips/menus.
+The UI follows the **5-layer TCP/IP model**: Application, Transport, Network, Data Link, Physical. For Submission 1, only **Physical** and **Data Link** are fully implemented. The remaining layers have UI placeholders and will be completed in future submissions.
 
 ---
 
-## 8. REST API summary
+## 5. Functional Specification
+
+### 5.1 Physical Layer
+
+The physical layer accepts a message or bit string, applies a chosen line encoding, and generates signal samples that are rendered as a waveform in the UI. Supported encodings include NRZ-L, NRZ-I, Manchester, Differential Manchester, AMI, and 4B5B. Both wired and wireless media are supported.
+
+### 5.2 Data Link Layer
+
+The data link layer wraps messages in frames and processes them through configurable protocol stages:
+
+| Category | Supported Options |
+|----------|------------------|
+| Framing | Variable-length (HDLC-style), Fixed-size |
+| Error control | CRC-32, Checksum, None |
+| MAC / Access control | Pure ALOHA, Slotted ALOHA, CSMA, CSMA/CD, CSMA/CA |
+| Flow / ARQ | Stop-and-Wait, Go-Back-N, Selective Repeat |
+
+### 5.3 Topology Runtime
+
+When a topology (devices + links) is submitted, the backend runs a topology-aware simulation. Hosts route frames toward the destination, switches learn MAC addresses on ingress and forward or flood accordingly, and hubs flood to all ports except ingress. The response includes broadcast/collision domain counts and a switch learning summary.
+
+### 5.4 Frontend — Simulator UI
+
+The simulator UI at `/simulator` provides a topology canvas for placing and connecting devices, a waveform panel for viewing encoded signals, a DLL configuration panel for selecting protocols, an event log filterable by layer, and a Switch MAC Tables view showing learned port mappings in real time.
+
+---
+
+## 6. REST API Summary
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | Health |
-| GET | `/api/encodings` | Encodings |
-| GET | `/api/media` | Media |
-| GET | `/api/datalink/options` | DLL keys |
-| POST | `/api/simulate/physical` | Physical run |
-| POST | `/api/simulate/datalink` | DLL run (+ optional topology) |
-| WS | `/ws/{session_id}` | Event stream |
-
-Schemas: `PhysicalSimReq`, `DataLinkSimReq` in `backend/main.py`.
+| GET | `/api/encodings` | List available line encodings |
+| GET | `/api/media` | List available media types |
+| GET | `/api/datalink/options` | List Data Link layer option keys |
+| POST | `/api/simulate/physical` | Run Physical layer simulation |
+| POST | `/api/simulate/datalink` | Run DLL simulation (with optional topology) |
+| WS | `/ws/{session_id}` | Real-time event stream |
 
 ---
 
-## 9. Design patterns (backend)
+## 7. Design Patterns (Backend)
 
-Strategy (encoding, medium, framing, error, MAC, flow), Template Method (layers), Observer (events), Factory (layers/devices).
-
----
-
-## 10. Limitations
-
-- Higher layers stubbed.  
-- Topology forwarding is educational (loop guards; not industrial STP).  
-- Local `npm run dev` may warn if `registry.npmjs.org` is unreachable; server often still starts.
+| Pattern | Applied To |
+|---------|-----------|
+| **Strategy** | Encoding, medium, framing, error control, MAC, flow control |
+| **Template Method** | Base Physical and Data Link layer classes |
+| **Observer** | Layer events → WebSocket broadcast |
+| **Factory** | Physical layer, Data Link layer, device creation |
 
 ---
 
-## 11. How to run (for graders)
+## 8. How to Run
 
 ```bash
 # Backend
-cd backend && pip install -r requirements.txt && uvicorn main:app --reload --port 8000
+cd backend && pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
 
 # Frontend
 cd frontend && npm install && npm run dev
-# → http://localhost:3000/simulator
+# Open http://localhost:3000/simulator
 ```
 
-```bash
-cd backend && pytest
-```
-
----
-
-## 12. Document history
-
-| Version | Date | Notes |
-|---------|------|--------|
-| 1.0 | — | Initial NetSim technical spec |
-| 2.0 | — | **Aligned with ITL351 Semester Project Submission 1 PDF** (objectives, deliverables, test-case mapping, add-ons) |
-
-*Update this file on each submission per course instructions.*
