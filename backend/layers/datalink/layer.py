@@ -11,9 +11,10 @@ Composed strategies: IFraming, IErrorControl, IMACProtocol, IFlowControl.
 Pattern: Template Method (skeleton) + Strategy (pluggable protocols) + Observer.
 """
 from __future__ import annotations
+import math
 import logging
 from abc import abstractmethod
-from typing import Optional
+from typing import Optional, Iterable
 
 _HEX_PREVIEW_N = 64
 
@@ -52,6 +53,7 @@ class DataLinkLayer(Layer):
         dst_mac   = pdu.meta.get("dst_mac", "ff:ff:ff:ff:ff:ff")
         ts        = pdu.meta.get("timestamp", 0.0)
         quiet_hop = bool(pdu.meta.get("topology_quiet_hop"))
+        inject_frames_raw: Iterable[int] = pdu.meta.get("inject_error_frames") or []
 
         # 1. Framing info event
         framed_raw = self._framing.frame(payload)
@@ -138,9 +140,18 @@ class DataLinkLayer(Layer):
         )
         pdu.meta["ethernet_frame"] = frame
 
-        # 5. Flow control: ARQ simulation (1 logical frame here)
-        flow_result = self._flow.transfer(total_frames=1,
-                                          error_rate=pdu.meta.get("link_error_rate", 0.0))
+        # 5. Flow control: ARQ simulation (N logical frames based on payload segmentation)
+        chunk_size = 2
+        if isinstance(self._framing, FixedSizeFraming):
+            chunk_size = max(1, int(getattr(self._framing, "frame_size", 128)))
+        total_frames = max(1, int(math.ceil(len(payload) / float(chunk_size))) if payload else 1)
+        inject_set = {int(x) for x in inject_frames_raw if isinstance(x, (int, float, str)) and str(x).strip().lstrip("-").isdigit()}
+        inject_set = {i for i in inject_set if 0 <= i < total_frames}
+        flow_result = self._flow.transfer(
+            total_frames=total_frames,
+            error_rate=pdu.meta.get("link_error_rate", 0.0),
+            inject_error_frames=inject_set,
+        )
         if not quiet_hop:
             self.emit(SimEvent(
                 timestamp=ts, event_type=EventType.FLOW_CONTROL,
@@ -148,8 +159,11 @@ class DataLinkLayer(Layer):
                 pdu=PDU(type="arq", headers={
                     "protocol":       self._flow.name,
                     "window_size":    self._flow.window_size,
+                    "total_frames":   total_frames,
                     "frames_sent":    flow_result.frames_sent,
+                    "total_transmissions": flow_result.total_transmissions,
                     "retransmissions":flow_result.retransmissions,
+                    "errored_frames": flow_result.errored_frames,
                     "efficiency":     round(flow_result.efficiency, 4),
                     "steps":          flow_result.steps,
                 }),

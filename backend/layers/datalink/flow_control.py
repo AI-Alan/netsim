@@ -13,7 +13,7 @@ from __future__ import annotations
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Iterable, Set
 
 
 @dataclass
@@ -21,14 +21,21 @@ class FlowResult:
     frames_sent:      int
     frames_acked:     int
     retransmissions:  int
+    total_transmissions: int
     efficiency:       float        # acked / sent
+    errored_frames:   list[int]    = field(default_factory=list)
     steps:            list[str]    = field(default_factory=list)
     detail:           str          = ""
 
 
 class IFlowControl(ABC):
     @abstractmethod
-    def transfer(self, total_frames: int, error_rate: float = 0.0) -> FlowResult:
+    def transfer(
+        self,
+        total_frames: int,
+        error_rate: float = 0.0,
+        inject_error_frames: Optional[Set[int]] = None,
+    ) -> FlowResult:
         """Simulate sending `total_frames` frames and return ARQ statistics."""
 
     @property
@@ -55,24 +62,40 @@ class StopAndWaitARQ(IFlowControl):
     @property
     def window_size(self) -> int: return 1
 
-    def transfer(self, total_frames: int, error_rate: float = 0.0) -> FlowResult:
+    def transfer(
+        self,
+        total_frames: int,
+        error_rate: float = 0.0,
+        inject_error_frames: Optional[Set[int]] = None,
+    ) -> FlowResult:
         steps: list[str] = []
         sent = retx = 0
         seq = 0
+        inject_remaining = set(inject_error_frames or set())
+        errored: list[int] = []
         for frame_no in range(total_frames):
             while True:
                 sent += 1
                 steps.append(f"Frame {frame_no} (seq={seq%2}): SENT → waiting ACK")
+                if frame_no in inject_remaining:
+                    inject_remaining.remove(frame_no)
+                    errored.append(frame_no)
+                    steps.append(f"  ✗ Injected error on frame {frame_no} (first transmission only)")
+                    steps.append(f"  ↺ Retransmitting frame {frame_no} (forced clean)")
+                    retx += 1
+                    continue
                 if random.random() < error_rate:
                     steps.append(f"  ✗ Error / timeout — retransmitting frame {frame_no}")
                     retx += 1
-                else:
-                    steps.append(f"  ✓ ACK {seq%2} received")
-                    seq += 1
-                    break
+                    continue
+                steps.append(f"  ✓ ACK {seq%2} received")
+                seq += 1
+                break
         eff = total_frames / sent if sent else 1.0
         return FlowResult(frames_sent=sent, frames_acked=total_frames,
-                          retransmissions=retx, efficiency=eff, steps=steps,
+                          retransmissions=retx, total_transmissions=sent,
+                          errored_frames=sorted(set(errored)),
+                          efficiency=eff, steps=steps,
                           detail=f"SAW: {total_frames} frames, {retx} retx, η={eff:.2%}")
 
 
@@ -93,11 +116,18 @@ class GoBackNARQ(IFlowControl):
     @property
     def window_size(self) -> int: return self._window
 
-    def transfer(self, total_frames: int, error_rate: float = 0.0) -> FlowResult:
+    def transfer(
+        self,
+        total_frames: int,
+        error_rate: float = 0.0,
+        inject_error_frames: Optional[Set[int]] = None,
+    ) -> FlowResult:
         steps: list[str] = []
         sent = retx = acked = 0
         base = 0
         next_seq = 0
+        inject_remaining = set(inject_error_frames or set())
+        errored: list[int] = []
 
         while base < total_frames:
             window_end = min(base + self._window, total_frames)
@@ -110,23 +140,35 @@ class GoBackNARQ(IFlowControl):
             for seq in batch:
                 sent += 1
                 steps.append(f"  → Frame {seq} sent")
-                if random.random() < error_rate and error_in < 0:
+                if seq in inject_remaining and error_in < 0:
+                    inject_remaining.remove(seq)
+                    errored.append(seq)
+                    error_in = seq
+                elif random.random() < error_rate and error_in < 0:
                     error_in = seq
 
             if error_in >= 0:
+                # Frames before the first error are assumed delivered/ACKed.
+                if error_in > base:
+                    acked += (error_in - base)
+                    base = error_in
                 go_back = window_end - error_in
                 retx += go_back
                 sent += go_back
                 steps.append(f"  ✗ Error at frame {error_in} — go back {go_back} frames, retransmit")
+                if error_in in errored:
+                    steps.append("    (Injected error applies only to first transmission; retransmit is clean)")
                 next_seq = error_in
             else:
                 steps.append(f"  ✓ ACK {window_end-1} cumulative — window advances")
-                acked += len(batch)
+                acked += (window_end - base)
                 base = window_end
                 next_seq = window_end
 
         eff = acked / sent if sent else 1.0
         return FlowResult(frames_sent=sent, frames_acked=acked, retransmissions=retx,
+                          total_transmissions=sent,
+                          errored_frames=sorted(set(errored)),
                           efficiency=eff, steps=steps,
                           detail=f"GBN W={self._window}: {acked} acked, {retx} retx, η={eff:.2%}")
 
@@ -149,12 +191,18 @@ class SelectiveRepeatARQ(IFlowControl):
     @property
     def window_size(self) -> int: return self._window
 
-    def transfer(self, total_frames: int, error_rate: float = 0.0) -> FlowResult:
+    def transfer(
+        self,
+        total_frames: int,
+        error_rate: float = 0.0,
+        inject_error_frames: Optional[Set[int]] = None,
+    ) -> FlowResult:
         steps: list[str] = []
         sent = retx = 0
         receiver_buffer: set[int] = set()
-        pending: list[int] = list(range(total_frames))
         acked: set[int] = set()
+        inject_remaining = set(inject_error_frames or set())
+        injected_errored: set[int] = set()
 
         base = 0
         while base < total_frames:
@@ -168,7 +216,12 @@ class SelectiveRepeatARQ(IFlowControl):
             errored: list[int] = []
             for seq in batch:
                 sent += 1
-                if random.random() < error_rate:
+                if seq in inject_remaining:
+                    inject_remaining.remove(seq)
+                    errored.append(seq)
+                    injected_errored.add(seq)
+                    steps.append(f"  ✗ Frame {seq} injected loss/corruption (first transmission only)")
+                elif random.random() < error_rate:
                     errored.append(seq)
                     steps.append(f"  ✗ Frame {seq} lost/errored")
                 else:
@@ -186,7 +239,10 @@ class SelectiveRepeatARQ(IFlowControl):
                 sent += 1
                 receiver_buffer.add(seq)
                 acked.add(seq)
-                steps.append(f"  ↺ Selective retransmit frame {seq} → ✓ ACK {seq}")
+                if seq in (inject_error_frames or set()):
+                    steps.append(f"  ↺ Selective retransmit frame {seq} (forced clean) → ✓ ACK {seq}")
+                else:
+                    steps.append(f"  ↺ Selective retransmit frame {seq} → ✓ ACK {seq}")
 
             # Advance base
             while base in acked:
@@ -194,6 +250,8 @@ class SelectiveRepeatARQ(IFlowControl):
 
         eff = len(acked) / sent if sent else 1.0
         return FlowResult(frames_sent=sent, frames_acked=len(acked), retransmissions=retx,
+                          total_transmissions=sent,
+                          errored_frames=sorted(injected_errored),
                           efficiency=eff, steps=steps,
                           detail=f"SR W={self._window}: {len(acked)} acked, {retx} retx, η={eff:.2%}")
 

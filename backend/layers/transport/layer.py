@@ -71,6 +71,8 @@ class TransportLayer(Layer):
     def _validate_config(self): ...
 
 class TransportLayerImpl(TransportLayer):
-    def __init__(self,device_id="unknown"):
-        super().__init__(); self.device_id=device_id; self._validate_config()
+    def __init__(self,device_id="unknown",use_tcp=True,port=None,**kwargs):
+        super().__init__(); self.device_id=device_id
+        self._use_tcp=use_tcp; self._port=port
+        self._validate_config()
     def _validate_config(self): pass

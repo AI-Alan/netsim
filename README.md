@@ -48,10 +48,21 @@ Session + Presentation (OSI 5–6) are folded into **Application** in the UI, ma
 
 ### Backend
 
+On macOS, `python` is often missing; use **`python3`** and a **virtual environment** so dependencies (e.g. Pydantic) match the interpreter you run.
+
 ```bash
 cd backend
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
+```
+
+One-off commands without activating the shell (sanity checks, scripts):
+
+```bash
+cd backend
+.venv/bin/python -c "from layers.network.layer import RoutingTable, RoutingEntry; print('ok')"
 ```
 
 ### Frontend
@@ -74,8 +85,9 @@ Open **http://localhost:3000** (landing) or **http://localhost:3000/simulator** 
 ### Tests
 
 ```bash
-# Backend
-cd backend && pytest
+# Backend (after venv is set up — see Backend section above)
+cd backend && .venv/bin/pytest
+# or: source .venv/bin/activate && pytest
 
 # Frontend (Vitest)
 cd frontend && npm test
@@ -105,4 +117,6 @@ Backend emits **`SimEvent`** JSON for layer actions. Types include `FRAMING_INFO
 
 ## Troubleshooting
 
+- **`command not found: python`:** Use `python3`, or after creating the venv use `.venv/bin/python` (see **Running locally → Backend**).
+- **`ModuleNotFoundError` (e.g. `pydantic`):** Install dependencies into the project venv with `python3 -m venv .venv` and `pip install -r requirements.txt` inside that environment; do not rely on the system Python alone.
 - **`fetch failed` / `ENOTFOUND registry.npmjs.org` on `npm run dev`:** Next.js may try to reach the npm registry during dev startup. If DNS/network fails, you may see a stack trace; the server often still reports **Ready**. Fix network/DNS or ignore if the app loads at localhost.

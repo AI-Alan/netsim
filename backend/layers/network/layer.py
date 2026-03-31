@@ -20,14 +20,41 @@ class IPPacket:
 class RoutingEntry:
     network: str; mask: str; next_hop: Optional[str]; metric: int = 1; interface: str = "eth0"
 
+def _ip_to_int(ip: str) -> int:
+    parts = ip.strip().split(".")
+    result = 0
+    for p in parts:
+        result = (result << 8) | (int(p) & 0xFF)
+    return result
+
+def _mask_to_int(mask: str) -> int:
+    if "/" in mask:
+        bits = int(mask.lstrip("/"))
+        return (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+    return _ip_to_int(mask)
+
 @dataclass
 class RoutingTable:
     entries: list = field(default_factory=list)
     def lookup(self, dst_ip):
+        try:
+            dst_int = _ip_to_int(dst_ip)
+        except (ValueError, AttributeError):
+            return None
+        best: Optional[RoutingEntry] = None
+        best_prefix_len = -1
         for e in self.entries:
-            if dst_ip.startswith(e.network.rstrip("0").rstrip(".")):
-                return e
-        return None
+            try:
+                net_int = _ip_to_int(e.network)
+                mask_int = _mask_to_int(e.mask)
+                if (dst_int & mask_int) == (net_int & mask_int):
+                    prefix_len = bin(mask_int).count("1")
+                    if prefix_len > best_prefix_len:
+                        best_prefix_len = prefix_len
+                        best = e
+            except (ValueError, AttributeError):
+                continue
+        return best
 
 class NetworkLayer(Layer):
     def __init__(self):

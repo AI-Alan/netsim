@@ -12,8 +12,11 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from hashlib import sha1
 import json
+import logging
 import random
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from layers.base import LayerPDU
 from layers.datalink.factory import DataLinkLayerFactory
@@ -399,12 +402,18 @@ def simulate_datalink_topology(
     flow_by_idx: dict[int, tuple[str, str]] = {}
     for fi, s, d, _, _ss in flows_raw:
         if s not in graph or d not in graph:
-            return [], domain_stats(graph), {}, [], {}
+            logger.warning("Flow %d skipped: device '%s' or '%s' not in topology", fi, s, d)
+            continue
         if s == d or not _is_endpoint(graph, s) or not _is_endpoint(graph, d):
-            return [], domain_stats(graph), {}, [], {}
+            logger.warning("Flow %d skipped: '%s' or '%s' is not a valid endpoint", fi, s, d)
+            continue
         if not _path_exists(s, d, graph):
-            return [], domain_stats(graph), {}, [], {}
+            logger.warning("Flow %d skipped: no path from '%s' to '%s'", fi, s, d)
+            continue
         flow_by_idx[fi] = (s, d)
+
+    if not flow_by_idx:
+        return [], domain_stats(graph), {}, [], {}
 
     collected: List[SimEvent] = []
     learning_summary: list[dict[str, Any]] = []
@@ -566,13 +575,16 @@ def simulate_datalink_topology(
                 flow_dst_device_id=fd,
             )
             if frame_kind == "data":
+                # ACK is unicast back to the original sender's MAC so switches
+                # do NOT flood it — flooding caused incorrect MAC learning where
+                # Host-6's MAC got associated with wrong ports (e.g. Host-4).
+                ack_dst_mac = graph[conversation_src].mac
                 _emit_engine(
                     collected,
                     float(hop),
                     node_id,
-                    "Destination sends broadcast ACK for learning.",
+                    "Destination sends unicast ACK to sender.",
                     dst=conversation_src,
-                    ack_broadcast=True,
                     flow_index=flow_index,
                     flow_src_device_id=fs,
                     flow_dst_device_id=fd,
@@ -583,7 +595,7 @@ def simulate_datalink_topology(
                         None,
                         hop + 1,
                         graph[node_id].mac,
-                        "ff:ff:ff:ff:ff:ff",
+                        ack_dst_mac,
                         b"ACK",
                         "ack",
                         conversation_src,
@@ -597,9 +609,11 @@ def simulate_datalink_topology(
         st = switch_tables.setdefault(node_id, {}) if node.device_type == "switch" else {}
         if node.device_type == "switch":
             st["__current_src_mac__"] = frame_src_mac
-        outs, info = role.forward(node, ingress_port, frame_dst_mac, frame_final_dst, graph, st)
-        if node.device_type == "switch":
-            st.pop("__current_src_mac__", None)
+        try:
+            outs, info = role.forward(node, ingress_port, frame_dst_mac, frame_final_dst, graph, st)
+        finally:
+            if node.device_type == "switch":
+                st.pop("__current_src_mac__", None)
 
         fs, fd = flow_by_idx[flow_index]
         _emit_engine(
@@ -670,6 +684,7 @@ def simulate_datalink_topology(
                 "collision_prob": req.collision_prob if out.medium == "wired" else max(req.collision_prob * 0.5, 0.0),
                 "link_error_rate": req.link_error_rate,
                 "inject_error": req.inject_error,
+                "inject_error_frames": getattr(req, "inject_error_frames", []) or [],
                 # Skip duplicate FRAMING/MAC/ARQ logs on every hop — first hop + hub contention carry the story.
                 "topology_quiet_hop": hop >= 1,
             })

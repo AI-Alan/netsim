@@ -288,6 +288,13 @@ def test_saw_with_errors_still_delivers():
     assert r.frames_acked == 6   # SAW always eventually delivers
     assert r.retransmissions >= 0
 
+def test_saw_inject_specific_frame_once_then_clean_retx():
+    r = StopAndWaitARQ().transfer(3, error_rate=0.0, inject_error_frames={1})
+    assert r.frames_acked == 3
+    assert r.errored_frames == [1]
+    assert r.retransmissions == 1
+    assert r.total_transmissions == r.frames_sent == 4
+
 def test_gbn_no_errors():
     r = GoBackNARQ(window=4).transfer(8, error_rate=0.0)
     assert r.frames_acked == 8 and r.retransmissions == 0
@@ -299,9 +306,21 @@ def test_gbn_efficiency_perfect():
     r = GoBackNARQ(window=4).transfer(8, error_rate=0.0)
     assert r.efficiency == 1.0
 
+def test_gbn_inject_frame_first_tx_only():
+    r = GoBackNARQ(window=4).transfer(6, error_rate=0.0, inject_error_frames={2})
+    assert r.frames_acked == 6
+    assert r.errored_frames == [2]
+    assert r.retransmissions > 0
+
 def test_sr_no_errors():
     r = SelectiveRepeatARQ(window=4).transfer(8, error_rate=0.0)
     assert r.frames_acked == 8 and r.retransmissions == 0
+
+def test_sr_inject_frame_first_tx_only():
+    r = SelectiveRepeatARQ(window=4).transfer(6, error_rate=0.0, inject_error_frames={3})
+    assert r.frames_acked == 6
+    assert r.errored_frames == [3]
+    assert r.retransmissions == 1
 
 def test_sr_higher_efficiency_than_gbn_under_errors():
     random.seed(42)

@@ -72,6 +72,7 @@ class DataLinkSimReq(BaseModel):
     collision_prob: float = 0.02
     link_error_rate:float = 0.0
     inject_error:   bool = False
+    inject_error_frames: List[int] = Field(default_factory=list)
     medium_kwargs:  Dict[str, Any] = {}
     mac_kwargs:     Dict[str, Any] = {}
     topology_devices: List[Dict[str, Any]] = []
@@ -193,6 +194,7 @@ async def simulate_datalink(req: DataLinkSimReq):
         "channel_busy": False, "collision_prob": req.collision_prob,
         "link_error_rate": req.link_error_rate,
         "inject_error": req.inject_error,
+        "inject_error_frames": req.inject_error_frames,
     })
     dll.send_down(pdu)
     return {

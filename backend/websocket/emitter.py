@@ -59,8 +59,11 @@ class WebSocketEmitter(ILayerObserver):
         try:
             payload = sim_event_to_json(event)
         except Exception:
-            import json, dataclasses as dc
-            payload = json.dumps(dc.asdict(event), default=str)
+            import json
+            try:
+                payload = json.dumps(event.model_dump(), default=str)
+            except Exception:
+                payload = json.dumps({"event_type": str(event.event_type)}, default=str)
 
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(

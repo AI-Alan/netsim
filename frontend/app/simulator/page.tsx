@@ -60,6 +60,26 @@ const MAX_EXTRA_FLOWS=5;
 const FLOW_ANIM_COLORS=["#f59e0b","#22c55e","#3b82f6","#a855f7","#ec4899","#14b8a6"] as const;
 
 type ExtraFlow={src:string;dst:string;msg:string;startSlot:string};
+
+/** Labels + colors for every flow role on a device (primary flow 1 + multi-flow rows). */
+function flowRoleBadges(
+  devId:string,
+  primarySrc:string|null,
+  primaryDst:string|null,
+  extras:ExtraFlow[],
+):{key:string;text:string;color:string}[]{
+  const out:{key:string;text:string;color:string}[]=[];
+  if(devId===primarySrc) out.push({key:"p-src",text:"SRC",color:"#34d399"});
+  if(devId===primaryDst) out.push({key:"p-dst",text:"DST",color:"#f87171"});
+  extras.forEach((row,i)=>{
+    const n=i+2;
+    const c=FLOW_ANIM_COLORS[i%FLOW_ANIM_COLORS.length] as string;
+    if(row.src&&row.src===devId) out.push({key:`e${i}-s`,text:`F${n}·SRC`,color:c});
+    if(row.dst&&row.dst===devId) out.push({key:`e${i}-d`,text:`F${n}·DST`,color:c});
+  });
+  return out;
+}
+
 type TrafficFlowPayload={
   src_device_id:string;
   dst_device_id:string;
@@ -195,6 +215,24 @@ function ph(o:Record<string,unknown>|undefined,k:string):string{
   return String(v);
 }
 
+function parseFrameList(raw:string):number[]{
+  const out:number[]=[];
+  for(const part of raw.split(/[,\s]+/g)){
+    const t=part.trim();
+    if(!t) continue;
+    const n=Number(t);
+    if(Number.isFinite(n) && Number.isInteger(n) && n>=0) out.push(n);
+  }
+  return Array.from(new Set(out)).sort((a,b)=>a-b);
+}
+
+function estimateTotalFrames(msg:string, framing:string, fixedFrameSize:number):number{
+  if(!msg) return 1;
+  const payloadBytes=new TextEncoder().encode(msg);
+  const chunkSize=framing==="fixed"?Math.max(1,Math.floor(fixedFrameSize||1)):2;
+  return Math.max(1,Math.ceil(payloadBytes.length/chunkSize));
+}
+
 /* ── resizable panel hook ───────────────────────────────────────────────── */
 function useResize(init:number,min:number,max:number,dir:"h"|"v"="h"){
   const [sz,setSz]=useState(init);
@@ -238,8 +276,9 @@ export default function SimulatorPage(){
   const [flowCtrl,setFlowCtrl]=useState("stop_and_wait");
   const [winSz,setWinSz]=useState(4);
   const [injectErr,setInjectErr]=useState(false);
+  const [injectErrFrames,setInjectErrFrames]=useState("");
   const [colProb,setColProb]=useState(0.02);
-  const [fixedFrameSize,setFixedFrameSize]=useState(128);
+  const [fixedFrameSize,setFixedFrameSize]=useState(32);
   const [clockRate,setClockRate]=useState(1000);
   const [samplesPerBit,setSamplesPerBit]=useState(100);
   const [showAdvanced,setShowAdvanced]=useState(false);
@@ -449,7 +488,7 @@ export default function SimulatorPage(){
     const id="dev_"+(++idSeq);
     return {id,type:normalized,x,y,layers:DEVICE_META[normalized].tcpip,
       label:normalized[0].toUpperCase()+normalized.slice(1)+"-"+idSeq,
-      ip:"192.168.1."+(9+idSeq), mac:randMac()};
+      ip:"192.168.1."+((9+idSeq-1)%245+10), mac:randMac()};
   }
 
   function handlePaletteDragOver(e:React.DragEvent){
@@ -472,12 +511,9 @@ export default function SimulatorPage(){
     const r=canvasRef.current?.getBoundingClientRect();
     if(!r)return;
     const dev=mkDev(normalized,e.clientX-r.left,e.clientY-r.top);
-    setDevices(p=>{
-      const next=[...p,dev];
-      if(!srcId)setSrcId(dev.id);
-      else if(!dstId)setDstId(dev.id);
-      return next;
-    });
+    setDevices(p=>[...p,dev]);
+    if(!srcId) setSrcId(dev.id);
+    else if(!dstId) setDstId(dev.id);
     addLog(`Placed ${dev.label}`,"engine");
     paletteDragRef.current=null;
     setDraggingType(null);
@@ -645,7 +681,7 @@ export default function SimulatorPage(){
     if(mode==="physical") return m.replace(/[^01]/g,"").split("").map(Number);
     const bytes=m.split("").map(c=>c.charCodeAt(0));
     const bits:number[]=[];
-    for(const b of bytes.slice(0,4)) for(let i=7;i>=0;i--) bits.push((b>>i)&1);
+    for(const b of bytes.slice(0,16)) for(let i=7;i>=0;i--) bits.push((b>>i)&1);
     return bits;
   }
 
@@ -682,6 +718,8 @@ export default function SimulatorPage(){
 
     try{
       const berF=parseFloat(ber);
+      const injectFrames=parseFrameList(injectErrFrames);
+      const injectFramesFinal=injectFrames.length?injectFrames:(injectErr?[0]:[]);
       const endpoint=simMode==="datalink"?"/api/simulate/datalink":"/api/simulate/physical";
       const body=simMode==="datalink"?{
         session_id:sessionId, src_device_id:srcId!, dst_device_id:dstId!,
@@ -692,7 +730,9 @@ export default function SimulatorPage(){
         window_size:winSz, encoding, medium:phyMedium,
         clock_rate:clockRate, samples_per_bit:samplesPerBit,
         medium_kwargs:berF>0?{ber:berF}:{},
-        collision_prob:colProb, link_error_rate:berF, inject_error:injectErr,
+        collision_prob:colProb, link_error_rate:berF,
+        inject_error:false,
+        inject_error_frames:injectFramesFinal,
         topology_devices: devices.map(d=>({id:d.id,type:toBackendDeviceType(d.type),label:d.label,mac:d.mac,ip:d.ip})),
         topology_links: links.map(l=>({id:l.id,src:l.src,dst:l.dst,medium:l.medium})),
         reset_learning: resetLearning,
@@ -728,11 +768,35 @@ export default function SimulatorPage(){
           addLog(`Learning: ${learned}`,"datalink");
         }
         for(const ev of backendEvents){
-          const l=EVT_LAYER[ev.event_type]||ev.layer||"engine";
+          const l=ev.layer||EVT_LAYER[ev.event_type]||"engine";
           const h=ev.pdu?.headers||{};
           const fp=flowPrefixFromEv(ev);
+          if(ev.event_type==="FLOW_CONTROL"){
+            const proto=String(h.protocol??"");
+            const w=String(h.window_size??"");
+            const tf=String(h.total_frames??"");
+            const ef=Array.isArray(h.errored_frames)?(h.errored_frames as unknown[]).map(String).join(","):"";
+            const sent=String(h.total_transmissions??h.frames_sent??"");
+            const retx=String(h.retransmissions??"");
+            const efTxt=ef?` errored=[${ef}]`:"";
+            addLog(`${fp}ARQ ${proto}${w?` W=${w}`:""} frames=${tf||"?"} tx_total=${sent||"?"} retx=${retx||"?"}${efTxt}`,"datalink");
+          }
           if(h.steps&&Array.isArray(h.steps)){
-            for(const s of(h.steps as string[]).slice(0,4)) addLog(`${fp}  ${s}`,l);
+            const allSteps=h.steps as string[];
+            // Collapse repeated collision lines: show first collision, last result, skip middle
+            const collisionLines=allSteps.filter(s=>s.includes("COLLISION")||s.includes("Collision"));
+            const successLine=allSteps.find(s=>s.includes("✓"));
+            const firstTwo=allSteps.slice(0,2);
+            let logSteps:string[];
+            if(collisionLines.length>1){
+              logSteps=[...firstTwo];
+              if(collisionLines.length>2) logSteps.push(`  … ${collisionLines.length} collisions total (BEB retries)`);
+              if(successLine) logSteps.push(`  ${successLine}`);
+              else logSteps.push(allSteps[allSteps.length-1]);
+            } else {
+              logSteps=allSteps.slice(0,4);
+            }
+            for(const s of logSteps) addLog(`${fp}  ${s}`,l);
           } else {
             let detail:string=ev.event_type;
             if(h.forwarding_mode==="flood"){
@@ -876,13 +940,18 @@ export default function SimulatorPage(){
       }
     }
 
+    const frameDropped=backendEvents.some(ev=>
+      ev.event_type==="FRAME_DROPPED"||(ev.event_type==="ERROR_DETECTED"&&!!(ev.pdu?.headers as Record<string,unknown>)?.dropped)
+    );
     if(trafficFlows.length>1){
-      addLog(`✓ Completed ${trafficFlows.length} flows (primary destination: ${dst.label})`,"engine");
+      addLog(`${frameDropped?"✗ Frame dropped during":"✓ Completed"} ${trafficFlows.length} flows (primary destination: ${dst.label})`,frameDropped?"datalink":"engine");
+    } else if(frameDropped){
+      addLog(`✗ Frame dropped — not delivered to ${dst.label}`,"datalink");
     } else {
       addLog(`✓ Delivered to ${dst.label}`,"engine");
     }
     addLog("━━ Complete ━━","engine");
-    setFlashDev(dstId!); setTimeout(()=>setFlashDev(null),900);
+    if(!frameDropped){ setFlashDev(dstId!); setTimeout(()=>setFlashDev(null),900); }
     setRunning(false); setSimRunning(false);
   }
 
@@ -1098,6 +1167,11 @@ export default function SimulatorPage(){
             :e.target.value.replace(/[^01]/g,"").slice(0,16))}
           placeholder={simMode==="datalink"?"Hello NetSim!":"10110100"}
           style={{...selSt,width:120,color:"#34d399"}}/>
+        {simMode==="datalink"&&(
+          <span style={{fontSize:10,color:"#6b7280"}} title="Computed as ceil(message_bytes / chunk_size). Chunk size = 2 by default, or fixed frame_size when framing=fixed.">
+            Frames: {estimateTotalFrames(msg,framing,fixedFrameSize)}
+          </span>
+        )}
 
         {/* DLL config toggle */}
         {simMode==="datalink"&&(
@@ -1286,15 +1360,25 @@ export default function SimulatorPage(){
           <div>
             <div style={{fontSize:10,color:"#6b7280",letterSpacing:1,marginBottom:5}}>OPTIONS</div>
             <div style={{display:"flex",flexDirection:"column",gap:6}}>
-              <label style={{fontSize:11,color:injectErr?"#f87171":"#4b5563",
+              <label style={{fontSize:11,color:(injectErr||injectErrFrames.trim())?"#f87171":"#4b5563",
                 cursor:"pointer",display:"flex",gap:5,alignItems:"center"}}>
                 <input type="checkbox" checked={injectErr} onChange={e=>setInjectErr(e.target.checked)}
                   style={{accentColor:"#f87171"}}/>
-                Inject bit error (backend flips a bit → ERROR_DETECTED / frame drop with CRC)
+                Inject ARQ error in frames (first transmission only; retransmissions forced clean)
               </label>
+              <div style={{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap"}}>
+                <span style={{fontSize:10,color:"#4b5563"}}>Error frames:</span>
+                <input
+                  value={injectErrFrames}
+                  onChange={e=>setInjectErrFrames(e.target.value)}
+                  placeholder="e.g. 2,5"
+                  style={{...selSt,width:140}}
+                />
+                <span style={{fontSize:10,color:"#6b7280"}}>comma/space-separated (defaults to frame 0 when checked)</span>
+              </div>
               <div style={{display:"flex",alignItems:"center",gap:7}}>
                 <span style={{fontSize:10,color:"#4b5563"}}>Collision prob:</span>
-                <input type="range" min={0} max={0.5} step={0.01} value={colProb}
+                <input type="range" min={0} max={1} step={0.01} value={colProb}
                   onChange={e=>setColProb(parseFloat(e.target.value))}
                   style={{width:80,accentColor:"#fbbf24"}}/>
                 <span style={{fontSize:11,color:"#fbbf24",width:32}}>{(colProb*100).toFixed(0)}%</span>
@@ -1548,8 +1632,9 @@ export default function SimulatorPage(){
             {/* device nodes */}
             {devices.map(dev=>{
               const meta=DEVICE_META[dev.type];
-              const isSrc=dev.id===srcId, isDst=dev.id===dstId, flash=dev.id===flashDev;
-              const bc=isSrc?"#34d399":isDst?"#f87171":meta.color;
+              const flowBadges=flowRoleBadges(dev.id,srcId,dstId,extraFlows);
+              const flash=dev.id===flashDev;
+              const bc=flowBadges.length?flowBadges[0].color:meta.color;
               return(
                 <div key={dev.id} data-device-id={dev.id} style={{
                   position:"absolute",left:dev.x-36,top:dev.y-34,width:72,height:68,
@@ -1558,7 +1643,7 @@ export default function SimulatorPage(){
                   display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
                   cursor:"grab",transition:"background .12s,box-shadow .12s",zIndex:10,userSelect:"none",
                   boxShadow:flash?`0 0 22px ${rgba("#34d399",.55)}`:
-                    (isSrc||isDst)?`0 0 10px ${rgba(bc,.35)}`:"0 2px 8px rgba(15,23,42,0.08)",
+                    flowBadges.length?`0 0 10px ${rgba(bc,.35)}`:"0 2px 8px rgba(15,23,42,0.08)",
                 }}
                   onDragOver={handlePaletteDragOver}
                   onDrop={handlePaletteDrop}
@@ -1624,9 +1709,9 @@ export default function SimulatorPage(){
                     overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",textAlign:"center"}}>
                     {dev.label}
                   </div>
-                  {(isSrc||isDst)&&(
-                    <div style={{fontSize:8,color:bc,fontWeight:700}}>{isSrc?"SRC":"DST"}</div>
-                  )}
+                  {flowBadges.map(b=>(
+                    <div key={b.key} style={{fontSize:7,color:b.color,fontWeight:700,lineHeight:1.15}}>{b.text}</div>
+                  ))}
                 </div>
               );
             })}
@@ -1645,8 +1730,12 @@ export default function SimulatorPage(){
                 <div style={{color:UI.textMuted}}>MAC: <span style={{color:"#7c3aed",fontSize:10}}>{tooltip.dev.mac}</span></div>
                 <div style={{color:UI.textMuted}}>TCP/IP: <span style={{color:"#059669"}}>layers 0–{tooltip.dev.layers}</span></div>
                 <div style={{color:UI.textMuted}}>Ports: <span style={{color:"#0f766e"}}>{portCountFor(tooltip.dev.id)}</span></div>
-                {tooltip.dev.id===srcId&&<div style={{color:"#34d399",marginTop:3}}>📤 SOURCE</div>}
-                {tooltip.dev.id===dstId&&<div style={{color:"#f87171",marginTop:3}}>📥 DESTINATION</div>}
+                {flowRoleBadges(tooltip.dev.id,srcId,dstId,extraFlows).map(b=>(
+                  <div key={b.key} style={{color:b.color,marginTop:3,fontSize:10}}>
+                    {(b.text==="SRC"||b.text.endsWith("·SRC"))?"📤 ":"📥 "}
+                    {b.text==="SRC"?"SOURCE (flow 1)":b.text==="DST"?"DESTINATION (flow 1)":b.text.replace("·"," · ")}
+                  </div>
+                ))}
               </div>
             )}
 

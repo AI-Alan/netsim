@@ -57,12 +57,12 @@ class PureAloha(IMACProtocol):
 
     def transmit(self, channel_busy: bool = False, collision_prob: float = 0.1) -> MACResult:
         steps: list[str] = []
+        current_prob = collision_prob
         for attempt in range(1, self.MAX_RETRIES + 1):
             steps.append(f"Attempt {attempt}: transmit immediately (no sensing)")
-            if random.random() < collision_prob:
+            if random.random() < current_prob:
                 backoff = random.randint(1, self.max_backoff)
                 steps.append(f"  ✗ Collision! Back-off {backoff} slots")
-                collision_prob *= 0.8   # reduce for retry
             else:
                 steps.append("  ✓ Frame sent successfully")
                 return MACResult(transmitted=True, attempts=attempt, steps=steps,
@@ -153,7 +153,7 @@ class CSMACD(IMACProtocol):
             steps.append(f"Attempt {k+1}: channel idle — begin transmission")
             if collision_prob >= 1.0 or random.random() < max(collision_prob / (k + 1), 0.005):
                 # 3. Collision detected
-                backoff = random.randint(0, min(2**k - 1, 1023))
+                backoff = random.randint(0, min(2**(k + 1) - 1, 1023))
                 steps.append(f"  ✗ COLLISION! Jam signal sent. BEB backoff = {backoff} slots")
                 continue
             else:

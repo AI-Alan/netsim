@@ -11,8 +11,11 @@ Variable-size (bit-oriented): flag bytes (0x7E) delimit frames;
 Pattern: Strategy – DataLinkLayer picks framing at runtime.
 """
 from __future__ import annotations
+import logging
 from abc import ABC, abstractmethod
 from typing import List
+
+logger = logging.getLogger(__name__)
 
 
 class IFraming(ABC):
@@ -45,6 +48,11 @@ class FixedSizeFraming(IFraming):
         return f"Fixed({self.frame_size}B)"
 
     def frame(self, data: bytes) -> bytes:
+        if len(data) > self.frame_size:
+            logger.warning(
+                "FixedSizeFraming: payload (%d B) exceeds frame_size (%d B) — truncating",
+                len(data), self.frame_size,
+            )
         padded = (data + b"\x00" * self.frame_size)[: self.frame_size]
         return self.FLAG + padded
 

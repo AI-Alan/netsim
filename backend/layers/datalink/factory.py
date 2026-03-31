@@ -16,9 +16,9 @@ class DataLinkLayerFactory:
         error:       str  = "crc32",
         mac_proto:   str  = "csma_cd",
         flow:        str  = "stop_and_wait",
-        framing_kwargs: dict = {},
-        flow_kwargs:    dict = {},
-        mac_kwargs:     dict = {},
+        framing_kwargs: dict | None = None,
+        flow_kwargs:    dict | None = None,
+        mac_kwargs:     dict | None = None,
     ) -> DataLinkLayerImpl:
         framing_cls = FRAMING_REGISTRY.get(framing, FRAMING_REGISTRY["variable"])
         error_cls   = ERROR_CONTROL_REGISTRY.get(error, ERROR_CONTROL_REGISTRY["crc32"])
@@ -28,10 +28,10 @@ class DataLinkLayerFactory:
         return DataLinkLayerImpl(
             device_id=device_id,
             mac_addr=mac_addr,
-            framing=framing_cls(**framing_kwargs),
+            framing=framing_cls(**(framing_kwargs or {})),
             error=error_cls(),
-            mac=mac_cls(**mac_kwargs),
-            flow=flow_cls(**flow_kwargs),
+            mac=mac_cls(**(mac_kwargs or {})),
+            flow=flow_cls(**(flow_kwargs or {})),
         )
 
     @staticmethod

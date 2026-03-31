@@ -27,12 +27,13 @@ class ApplicationLayer(Layer):
         ts=pdu.meta.get("timestamp",0.0)
         payload=str(pdu.data) if not isinstance(pdu.data,str) else pdu.data
 
-        # 1. Session open (folded-in session layer duty)
-        self._session_id=pdu.meta.get("session_id","sess-001")
-        self.emit(SimEvent(timestamp=ts,event_type=EventType.SESSION_INFO,
-            layer=LayerName.APPLICATION,src_device=self.device_id,
-            pdu=PDU(type="session",headers={"action":"open","session_id":self._session_id}),
-            meta={"note":"Session+Presentation merged into Application (TCP/IP model)"}))
+        # 1. Session open (folded-in session layer duty) — only once per session
+        if self._session_id is None:
+            self._session_id=pdu.meta.get("session_id","sess-001")
+            self.emit(SimEvent(timestamp=ts,event_type=EventType.SESSION_INFO,
+                layer=LayerName.APPLICATION,src_device=self.device_id,
+                pdu=PDU(type="session",headers={"action":"open","session_id":self._session_id}),
+                meta={"note":"Session+Presentation merged into Application (TCP/IP model)"}))
 
         # 2. Presentation: encode/encrypt (folded-in presentation layer duty)
         encoded=base64.b64encode(payload.encode()).decode() if self._encoding_scheme=="base64" else payload
@@ -82,9 +83,18 @@ class ApplicationLayer(Layer):
     def _validate_config(self): ...
 
 class ApplicationLayerImpl(ApplicationLayer):
-    def __init__(self,device_id="unknown",app_proto="http",encoding="base64",encrypt=False):
+    def __init__(self,device_id="unknown",app_proto="http",encoding="base64",encrypt=False,
+                 encode_b64=None,xor_key=None,**kwargs):
         super().__init__()
         self.device_id=device_id; self._app_proto=app_proto
-        self._encoding_scheme=encoding; self._encrypt=encrypt
+        # encode_b64 and xor_key are alternate kwargs used in tests
+        if encode_b64 is not None:
+            self._encoding_scheme="base64" if encode_b64 else "none"
+        else:
+            self._encoding_scheme=encoding
+        if xor_key is not None:
+            self._encrypt=True; self._xor_key=xor_key
+        else:
+            self._encrypt=encrypt; self._xor_key=0x5A
         self._validate_config()
     def _validate_config(self): pass
